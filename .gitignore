@@ -1,0 +1,5 @@
+# Runtime archive of pre-compaction conversation snapshots — sensitive
+# (contains full transcripts incl. any secrets the session touched). Never commit.
+archive/
+failure.log
+node_modules/
