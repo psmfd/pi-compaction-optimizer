@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/psmfd/pi-config/agent/extensions/compaction-optimizer/settings.schema.json",
+  "title": "compaction-optimizer settings",
+  "description": "Schema for extensionSettings.compactionOptimizer.* in ~/.pi/agent/settings.json (user) and <cwd>/.pi/settings.json (project). Documentation-only — pi v0.75.5 does not run runtime schema validation. Numeric bounds below mirror the project-layer runtime clamps in lib/settings.ts (PROJECT_LAYER_CLAMPS); the user layer is not runtime-clamped but operators should treat these bounds as the recommended envelope. See ADR-0019 and #210.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "mode": {
+      "type": "string",
+      "enum": ["hybrid", "deterministic", "llm-only-with-dump"],
+      "default": "hybrid",
+      "description": "Summary generation mode. `hybrid` (default) runs the deterministic LLM-free builder when the conversation is tool-call-dense and falls through to pi's LLM summarizer otherwise. `deterministic` always runs the builder (drops /compact custom instructions with a warning). `llm-only-with-dump` never runs the builder — pi's default summarizer + archive only."
+    },
+    "hybrid": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxMessages": { "type": "integer", "minimum": 1, "maximum": 2000, "default": 200 },
+        "maxTokens": { "type": "integer", "minimum": 1, "maximum": 500000, "default": 60000 },
+        "minToolCallRatio": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.3 },
+        "maxOrphanAssistantTokens": { "type": "integer", "minimum": 0, "maximum": 100000, "default": 2000 },
+        "previousSummaryMaxChars": { "type": "integer", "minimum": 0, "maximum": 100000, "default": 500, "description": "Cap on chars of the prior summary re-inlined into the deterministic builder's Carried-Forward Context section. 0 omits the section entirely; the full prior summary always remains in the archive. Bounds geometric growth across compactions (#253)." }
+      }
+    },
+    "fileTracker": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxReadFiles": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000,
+          "default": 50,
+          "description": "Cap on the size of preparation.fileOps.read after pruning. Excess entries are evicted in insertion order, keeping the most recent N. modifiedFiles is never pruned."
+        },
+        "staleAfterCompactions": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 3,
+          "description": "Reserved for future use; PR1 does not surface per-file age, so this key is informational only."
+        },
+        "dropPatterns": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Regex patterns; matching paths are dropped from fileOps.read before the cap is applied. modifiedFiles is unaffected. User layer only — project-layer values are rejected with a notify warning (regex ReDoS surface; see ADR-0019 Threat Model)."
+        }
+      }
+    },
+    "archive": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "default": true },
+        "path": {
+          "type": "string",
+          "description": "Absolute or ~-rooted directory where per-session archives are written. User layer only — project-layer values are rejected with a notify warning per ADR-0019 Threat Model.",
+          "default": "~/.pi/agent/extensions/compaction-optimizer/archive"
+        },
+        "ephemeralBehavior": {
+          "type": "string",
+          "enum": ["skip", "tmp"],
+          "default": "skip",
+          "description": "Behavior for sessions where sessionManager.isPersisted() === false. 'tmp' uses mkdtemp under $TMPDIR with mode 0o700, swept after 24h. User layer only."
+        },
+        "redactPatterns": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Regex patterns applied to archive content before write; matches replaced with [REDACTED]. Best-effort: each pattern runs under a 250ms wall-clock budget. User layer only."
+        }
+      }
+    }
+  }
+}
