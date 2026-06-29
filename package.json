@@ -1,25 +1,30 @@
 {
-	"name": "@psmfd/pi-compaction-optimizer",
-	"version": "0.1.0",
-	"description": "Pi extension: deterministic/hybrid context-compaction summaries with a local archive of pre-compaction snapshots",
-	"type": "module",
-	"license": "MIT",
-	"repository": "github:psmfd/pi-compaction-optimizer",
-	"keywords": ["pi", "pi-extension"],
-	"pi": {
-		"extensions": ["./index.ts"]
-	},
-	"scripts": {
-		"typecheck": "tsc --noEmit",
-		"test": "tsx --test test/*.test.ts"
-	},
-	"peerDependencies": {
-		"@earendil-works/pi-coding-agent": ">=0.75"
-	},
-	"devDependencies": {
-		"@earendil-works/pi-coding-agent": "0.79.3",
-		"@types/node": "^25.9.3",
-		"tsx": "^4.19.2",
-		"typescript": "^6.0.3"
-	}
+  "name": "@psmfd/pi-compaction-optimizer",
+  "version": "0.1.1",
+  "description": "Pi extension: deterministic/hybrid context-compaction summaries with a local archive of pre-compaction snapshots",
+  "type": "module",
+  "license": "MIT",
+  "repository": "github:psmfd/pi-compaction-optimizer",
+  "keywords": [
+    "pi",
+    "pi-extension"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.75"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.79.3",
+    "@types/node": "^25.9.3",
+    "tsx": "^4.19.2",
+    "typescript": "^6.0.3"
+  }
 }

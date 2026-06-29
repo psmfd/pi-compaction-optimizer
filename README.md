@@ -8,6 +8,14 @@ See [ADR-0019](https://github.com/psmfd/pi-config/blob/main/adrs/0019-compaction
 full design, threat model, and dissent record. This README is the operator-
 facing surface.
 
+## Install
+
+```sh
+pi install git:github.com/psmfd/pi-compaction-optimizer
+```
+
+Try it first without installing: `pi -e git:github.com/psmfd/pi-compaction-optimizer`.
+
 ## What it does
 
 | Handler                  | Phase       | Behavior                                                                                            |
