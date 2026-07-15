@@ -22,6 +22,7 @@
     "@earendil-works/pi-coding-agent": ">=0.75"
   },
   "devDependencies": {
+    "@earendil-works/pi-agent-core": "0.80.3",
     "@earendil-works/pi-coding-agent": "0.80.3",
     "@types/node": "^25.9.3",
     "tsx": "^4.19.2",
