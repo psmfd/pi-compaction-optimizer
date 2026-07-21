@@ -1,9 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+	buildAtRung,
 	buildDeterministicSummary,
+	estimateSummaryTokens,
 	estimateTokens,
 	orphanAssistantTokens,
+	RUNG_ORDER,
 	toolCallCount,
 	type FileOperationsLike,
 } from "../lib/deterministic-summary.ts";
@@ -96,8 +99,8 @@ test("buildDeterministicSummary: section ordering and headings", () => {
 		generatedAt: "2026-01-01T00:00:00.000Z",
 		customInstructionsDropped: false,
 	});
+	// `## Goal` was removed as unconditional dedup of User Turns #1 (#254).
 	const sections = [
-		"## Goal",
 		"## User Turns (verbatim)",
 		"## File Activity",
 		"## Tool Activity Summary",
@@ -110,6 +113,7 @@ test("buildDeterministicSummary: section ordering and headings", () => {
 		assert.ok(idx > last, `${s} must come after the previous section (last=${last}, idx=${idx})`);
 		last = idx;
 	}
+	assert.ok(!out.includes("## Goal"), "## Goal is dedup-dropped at every rung (#254)");
 });
 
 test("buildDeterministicSummary: file list is sorted (defeats Set insertion-order leakage)", () => {
@@ -424,8 +428,7 @@ test("buildDeterministicSummary: empty input degrades gracefully", () => {
 		generatedAt: "2026-01-01T00:00:00.000Z",
 		customInstructionsDropped: false,
 	});
-	assert.match(out, /## Goal[\s\S]*no user message in summarized span/);
-	assert.match(out, /\(none\)/);
+	assert.match(out, /## User Turns \(verbatim\)[\s\S]*\(none\)/);
 	assert.match(out, /entries_summarized: 0/);
 });
 
@@ -661,4 +664,137 @@ test("verdict extraction #229: fallback caps row count to agents.length (fail-cl
 	assert.equal(tableRows.length, 2, `expected 2 verdict rows; got ${tableRows.length}\n${out}`);
 	assert.match(out, /agent-a.*PASS\b/);
 	assert.match(out, /agent-b.*NEEDS_CHANGES/);
+});
+
+// ---------------------------------------------------------------------------
+// Shrink ladder (#254, ADR-0108)
+// ---------------------------------------------------------------------------
+
+function richInput() {
+	const messages: unknown[] = [];
+	// 15 user turns so trimmed (first + last 9) and stub (first + last 2) elide.
+	for (let i = 1; i <= 15; i++) {
+		messages.push(userMsg(`turn-${i} ${"x".repeat(60)}`, i));
+		messages.push(assistantToolCall("bash", { command: `cmd${i}` }, `tc${i}`, i));
+		messages.push(toolResult("bash", `tc${i}`, "ok", i));
+	}
+	messages.push(assistantToolCall("subagent", { agent: "linter" }, "tc-sub", 90));
+	messages.push(
+		toolResult("subagent", "tc-sub", "brief text here\n\nREPORT_FILE: .review/x.md\n\nVerdict: PASS", 91),
+	);
+	messages.push(bashExec("echo " + "y".repeat(200), "out", 95));
+	const turnPrefix: unknown[] = [];
+	for (let i = 0; i < 20; i++) turnPrefix.push(assistantText(`prefix-${i}`, 100 + i));
+	return {
+		messagesToSummarize: messages as never,
+		turnPrefixMessages: turnPrefix as never,
+		isSplitTurn: true,
+		previousSummary: "prior summary content",
+		fileOps: {
+			read: new Set(["r1.ts", "r2.ts"]),
+			written: new Set(["w1.ts"]),
+			edited: new Set(["e1.ts"]),
+		} as FileOperationsLike,
+		tokensBefore: 5000,
+		generatedAt: "2026-07-20T00:00:00.000Z",
+		customInstructionsDropped: true,
+	};
+}
+
+test("buildAtRung: every rung is byte-deterministic for identical input", () => {
+	const input = richInput();
+	for (const rung of RUNG_ORDER) {
+		const a = buildAtRung(input, rung);
+		const b = buildAtRung(input, rung);
+		assert.equal(a, b, `rung ${rung} must be byte-deterministic`);
+	}
+});
+
+test("buildAtRung: rungs drop sections cumulatively and never grow output", () => {
+	const input = richInput();
+	const outputs = RUNG_ORDER.map((r) => buildAtRung(input, r));
+	// Monotonic non-increase down the ladder.
+	for (let i = 1; i < outputs.length; i++) {
+		assert.ok(
+			outputs[i].length <= outputs[i - 1].length,
+			`rung ${RUNG_ORDER[i]} output (${outputs[i].length}) must not exceed ${RUNG_ORDER[i - 1]} (${outputs[i - 1].length})`,
+		);
+	}
+	const at = (rung: string) => outputs[RUNG_ORDER.indexOf(rung as never)];
+	// full keeps everything (except the dedup-dropped Goal).
+	assert.match(at("full"), /## File Activity/);
+	assert.match(at("full"), /## Tool Activity Summary/);
+	assert.match(at("full"), /\| Agent \| Verdict \| Brief \|/);
+	assert.match(at("full"), /## Turn Prefix \(split turn\)/);
+	assert.match(at("full"), /## Carried-Forward Context/);
+	// no-file-activity drops File Activity, keeps Tool Activity.
+	assert.ok(!at("no-file-activity").includes("## File Activity"));
+	assert.match(at("no-file-activity"), /## Tool Activity Summary/);
+	// no-tools also drops Tool Activity (cumulative).
+	assert.ok(!at("no-tools").includes("## File Activity"));
+	assert.ok(!at("no-tools").includes("## Tool Activity Summary"));
+	// no-verdict-brief collapses the table to Agent|Verdict|Ref.
+	assert.match(at("no-verdict-brief"), /\| Agent \| Verdict \| Ref \|/);
+	assert.ok(!at("no-verdict-brief").includes("brief text here"));
+	assert.match(at("no-verdict-brief"), /\.review\/x\.md/);
+	// no-prefix drops the Turn Prefix section.
+	assert.ok(!at("no-prefix").includes("## Turn Prefix"));
+	// no-carried-forward drops Carried-Forward even though previousSummary set.
+	assert.ok(!at("no-carried-forward").includes("## Carried-Forward Context"));
+	// trimmed-turns keeps turn 1 + last 9 with an elision marker.
+	assert.match(at("trimmed-turns"), /1\. turn-1 /);
+	assert.match(at("trimmed-turns"), /15\. turn-15 /);
+	assert.match(at("trimmed-turns"), /5 earlier turns elided/);
+	assert.ok(!/\n3\. turn-3 /.test(at("trimmed-turns")), "turn 3 must be elided at trimmed-turns");
+	// stub: turn 1 + last 2, two-column verdict table, footer dropped.
+	assert.match(at("stub"), /1\. turn-1 /);
+	assert.match(at("stub"), /14\. turn-14 /);
+	assert.match(at("stub"), /\| Agent \| Verdict \|\n\|---\|---\|/);
+	assert.ok(!at("stub").includes("| Brief |") && !at("stub").includes("| Ref |"));
+	assert.ok(!at("stub").includes("not honored"), "instructions footer dropped at stub");
+	// Compaction Metadata survives EVERY rung (ADR-0108 invariant).
+	for (let i = 0; i < outputs.length; i++) {
+		assert.match(outputs[i], /## Compaction Metadata/, `metadata missing at ${RUNG_ORDER[i]}`);
+		assert.match(outputs[i], /generated_by: compaction-optimizer \(deterministic\)/);
+	}
+});
+
+test("buildAtRung: stub degrades gracefully at 0 and 1 user turns", () => {
+	const base = { ...richInput(), messagesToSummarize: [] as never };
+	const none = buildAtRung(base, "stub");
+	assert.match(none, /## User Turns \(verbatim\)[\s\S]*\(none\)/);
+	const one = buildAtRung(
+		{ ...richInput(), messagesToSummarize: [userMsg("only turn")] as never },
+		"stub",
+	);
+	assert.match(one, /1\. only turn/);
+	assert.ok(!one.includes("elided"), "no elision marker with a single turn");
+});
+
+test("renderTurnPrefix: aggregate cap keeps last 12 messages with elision marker", () => {
+	const input = richInput(); // 20 prefix messages
+	const out = buildAtRung(input, "full");
+	assert.match(out, /8 earlier prefix messages elided/);
+	assert.ok(!out.includes("**assistant** — prefix-7"), "message 8 (index 7) must be elided");
+	assert.match(out, /9\. \*\*assistant\*\* — prefix-8/);
+	assert.match(out, /20\. \*\*assistant\*\* — prefix-19/);
+});
+
+test("renderToolActivity: bash last-command truncated to 80 chars", () => {
+	const out = buildAtRung(richInput(), "full");
+	const m = /\(last: `([^`]+)`\)/.exec(out);
+	assert.ok(m, "expected a (last: ...) suffix");
+	assert.ok(m[1].length <= 81, `last-command must be capped (~80 chars), got ${m[1].length}`);
+	assert.match(m[1], /…$/);
+});
+
+test("estimateSummaryTokens: chars/4 ceiling", () => {
+	assert.equal(estimateSummaryTokens(""), 0);
+	assert.equal(estimateSummaryTokens("abcd"), 1);
+	assert.equal(estimateSummaryTokens("abcde"), 2);
+});
+
+test("buildDeterministicSummary === buildAtRung(input, 'full') (back-compat wrapper)", () => {
+	const input = richInput();
+	assert.equal(buildDeterministicSummary(input), buildAtRung(input, "full"));
 });

@@ -16,10 +16,12 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "maxMessages": { "type": "integer", "minimum": 1, "maximum": 2000, "default": 200 },
-        "maxTokens": { "type": "integer", "minimum": 1, "maximum": 500000, "default": 60000 },
+        "maxMessages": { "type": "integer", "minimum": 1, "maximum": 2000, "default": 500 },
+        "maxTokens": { "type": "integer", "minimum": 1, "maximum": 500000, "default": 200000, "description": "Absolute floor of the too-many-tokens gate; the sole gate when the active model's context window is unknown. The effective ceiling is max(maxTokens, maxTokensFraction × contextWindow). See ADR-0107." },
+        "maxTokensFraction": { "type": "number", "minimum": 0, "maximum": 5, "default": 1.0, "description": "Context-window-relative token gate (#244, ADR-0107): with a known context window, the too-many-tokens fall-through fires only when tokensBefore exceeds max(maxTokens, maxTokensFraction × contextWindow). Default 1.0 lets ordinary threshold compactions (~0.9 × contextWindow) take the deterministic path on every model." },
         "minToolCallRatio": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.3 },
-        "maxOrphanAssistantTokens": { "type": "integer", "minimum": 0, "maximum": 100000, "default": 2000 },
+        "maxOrphanAssistantTokens": { "type": "integer", "minimum": 0, "maximum": 100000, "default": 30000 },
+        "maxOutputTokens": { "type": "integer", "minimum": 2000, "maximum": 100000, "default": 8000, "description": "Output-side token budget for the deterministic builder (#254, ADR-0108). The summary is re-built at progressively lower fidelity rungs (drop file activity → tool activity → verdict briefs → turn prefix → carried-forward → trimmed turns → stub) until it fits. Always-on; in hybrid mode an over-budget stub falls through to pi's LLM summarizer, in deterministic mode the stub is emitted anyway with a warning (air-gap preserved)." },
         "previousSummaryMaxChars": { "type": "integer", "minimum": 0, "maximum": 100000, "default": 500, "description": "Cap on chars of the prior summary re-inlined into the deterministic builder's Carried-Forward Context section. 0 omits the section entirely; the full prior summary always remains in the archive. Bounds geometric growth across compactions (#253)." }
       }
     },
@@ -47,6 +49,19 @@
           "default": [],
           "description": "Regex patterns; matching paths are dropped from fileOps.read before the cap is applied. modifiedFiles is unaffected. User layer only — project-layer values are rejected with a notify warning (regex ReDoS surface; see ADR-0019 Threat Model)."
         }
+      }
+    },
+    "timing": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Compaction when-policy (#677, ADR-0109): defer mid-phase threshold compactions and trigger proactively at phase boundaries on prefix-cached local hosts. USER LAYER ONLY — every timing.* key is project-layer rejected (ADR-0094 trust posture for local-LLM levers). Off by default.",
+      "properties": {
+        "enabled": { "type": "boolean", "default": false },
+        "providers": { "type": "array", "items": { "type": "string" }, "default": ["omlx"], "description": "Providers the policy applies to. The deferral band only exists where reserveTokens exceeds (1 − deferCeilingFraction) × contextWindow — ~3.3K tokens on a 131K-window local model, none at ≥164K windows with defaults." },
+        "deferCeilingFraction": { "type": "number", "minimum": 0.5, "maximum": 1.0, "default": 0.9, "description": "At or above this fraction of the context window a threshold compaction is never deferred. Mirrors FORCE_COMPACT_AT in shared/signals.ts." },
+        "proactiveAtFraction": { "type": "number", "minimum": 0.1, "maximum": 1.0, "default": 0.75, "description": "Usage fraction at which a fresh task-type boundary (agent settled, no fan-out in flight) may trigger a proactive ctx.compact()." },
+        "maxDeferrals": { "type": "integer", "minimum": 1, "maximum": 100, "default": 10 },
+        "boundaryWindowTurns": { "type": "integer", "minimum": 0, "maximum": 20, "default": 1, "description": "A task-type transition within this many turns counts as 'at a boundary' (never defer; proactive may fire)." }
       }
     },
     "archive": {

@@ -16,6 +16,10 @@
 
 import type { FileTrackerSettings } from "./settings.ts";
 
+/** Aggregate wall-clock budget for drop-pattern matching per prune call
+ *  (mirrors archive.ts REDACT_BUDGET_MS; see the comment at the use site). */
+const PRUNE_PATTERN_BUDGET_MS = 250;
+
 export interface FileOperationsLike {
 	read: Set<string>;
 	written: Set<string>;
@@ -55,13 +59,21 @@ export function pruneReadSet(
 ): PruneResult {
 	const readBefore = fileOps.read.size;
 
-	// Step 1: drop-by-pattern.
+	// Step 1: drop-by-pattern, under a wall-clock budget. Same posture as
+	// archive.ts's applyRedaction (REDACT_BUDGET_MS): dropPatterns is
+	// user-layer-only regex input with an accepted self-DoS surface, but a
+	// catastrophic-backtracking pattern must degrade (skip remaining
+	// matching) rather than hang EVERY compaction attempt — this runs on
+	// every session_before_compact fire (#781 review finding). A single
+	// in-flight match cannot be preempted; the budget bounds the aggregate.
 	const patterns = settings.dropPatterns
 		.map((p) => compilePattern(p))
 		.filter((r): r is RegExp => r !== undefined);
 	let droppedByPattern = 0;
 	if (patterns.length > 0) {
+		const started = Date.now();
 		for (const path of fileOps.read) {
+			if (Date.now() - started > PRUNE_PATTERN_BUDGET_MS) break;
 			if (patterns.some((re) => re.test(path))) {
 				fileOps.read.delete(path);
 				droppedByPattern++;

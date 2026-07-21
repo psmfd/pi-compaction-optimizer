@@ -2,9 +2,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { decideHybrid, type HybridThresholds } from "../lib/hybrid.ts";
 
+// Deliberately fixed unit-test thresholds, independent of production
+// DEFAULTS — fixtures below are sized to cross these exact values.
 const THRESHOLDS: HybridThresholds = {
 	maxMessages: 200,
 	maxTokens: 60000,
+	maxTokensFraction: 1.0,
 	minToolCallRatio: 0.3,
 	maxOrphanAssistantTokens: 2000,
 };
@@ -99,6 +102,59 @@ test("hybrid: tokensBefore > maxTokens → fall-through", () => {
 	});
 	assert.equal(r.decision, "fall-through");
 	assert.equal(r.reason, "too-many-tokens");
+});
+
+test("hybrid: known contextWindow lifts the token gate to fraction × window (ADR-0107)", () => {
+	// A threshold compaction fires at ~0.9 × contextWindow: 118000 on a 131072
+	// window. Over the 60000 floor, but under 1.0 × window → deterministic.
+	const r = decideHybrid({
+		messages: toolHeavyCluster() as never,
+		tokensBefore: 118000,
+		contextWindow: 131072,
+		thresholds: THRESHOLDS,
+	});
+	assert.equal(r.decision, "deterministic");
+	assert.equal(r.reason, "ok");
+	assert.equal(r.metrics.effectiveMaxTokens, 131072);
+});
+
+test("hybrid: tokensBefore above fraction × window still falls through", () => {
+	const r = decideHybrid({
+		messages: toolHeavyCluster() as never,
+		tokensBefore: 140000,
+		contextWindow: 131072,
+		thresholds: THRESHOLDS,
+	});
+	assert.equal(r.decision, "fall-through");
+	assert.equal(r.reason, "too-many-tokens");
+});
+
+test("hybrid: unknown/zero contextWindow falls back to the absolute maxTokens floor", () => {
+	for (const contextWindow of [undefined, 0, -1, Number.NaN]) {
+		const r = decideHybrid({
+			messages: toolHeavyCluster() as never,
+			tokensBefore: 100000,
+			contextWindow,
+			thresholds: THRESHOLDS,
+		});
+		assert.equal(r.decision, "fall-through");
+		assert.equal(r.reason, "too-many-tokens");
+		assert.equal(r.metrics.effectiveMaxTokens, THRESHOLDS.maxTokens);
+	}
+});
+
+test("hybrid: explicit absolute maxTokens override is never narrowed by a smaller window", () => {
+	// Regression for the operator maxTokens=400000 workaround: on a small-window
+	// model, max(absolute, fraction × window) must keep the wider absolute gate.
+	const r = decideHybrid({
+		messages: toolHeavyCluster() as never,
+		tokensBefore: 300000,
+		contextWindow: 131072,
+		thresholds: { ...THRESHOLDS, maxTokens: 400000 },
+	});
+	assert.equal(r.decision, "deterministic");
+	assert.equal(r.reason, "ok");
+	assert.equal(r.metrics.effectiveMaxTokens, 400000);
 });
 
 test("hybrid: low tool-call ratio (chatty cluster) → fall-through", () => {

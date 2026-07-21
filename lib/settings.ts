@@ -24,8 +24,24 @@ export type EphemeralBehavior = "skip" | "tmp";
 export interface HybridThresholds {
 	maxMessages?: number;
 	maxTokens?: number;
+	/**
+	 * Context-window-relative token gate (#244, ADR-0107): the effective
+	 * ceiling for the `too-many-tokens` fall-through is
+	 * `max(maxTokens, maxTokensFraction × contextWindow)` when the active
+	 * model's window is known; `maxTokens` alone otherwise.
+	 */
+	maxTokensFraction?: number;
 	minToolCallRatio?: number;
 	maxOrphanAssistantTokens?: number;
+	/**
+	 * Output-side token budget for the deterministic builder (#254,
+	 * ADR-0108). After the dispatcher chooses the deterministic path, the
+	 * rendered summary is re-built at progressively lower fidelity rungs
+	 * until it fits this budget (chars/4 estimate). Always-on — no disable
+	 * sentinel (0 would collide with previousSummaryMaxChars' established
+	 * "0 = omit" idiom); the clamp floor is the effective minimum.
+	 */
+	maxOutputTokens?: number;
 	/**
 	 * Cap on the number of characters of `previousSummary` re-inlined into
 	 * the deterministic builder's `## Carried-Forward Context` section.
@@ -54,11 +70,41 @@ export interface ArchiveSettings {
 	redactPatterns?: string[];
 }
 
+/**
+ * When-policy settings (#677, ADR-0109): compaction timing on prefix-cached
+ * local hosts. USER-LAYER ONLY — every `timing.*` key is project-layer
+ * rejected, matching the ADR-0094/ADR-0106 trust posture for local-LLM
+ * levers: a cloned repo must not be able to influence when this host defers
+ * or triggers compactions.
+ */
+export interface TimingSettings {
+	/** Master switch for the when-policy (defer + proactive). Default false. */
+	enabled?: boolean;
+	/** Providers the policy applies to (prefix-cached local hosts). */
+	providers?: string[];
+	/**
+	 * Deferral ceiling as a fraction of the model's context window: at or
+	 * above it a threshold compaction is never deferred. Mirrors
+	 * `FORCE_COMPACT_AT` in `shared/signals.ts`.
+	 */
+	deferCeilingFraction?: number;
+	/** Usage fraction at which a phase-boundary proactive compaction may fire. */
+	proactiveAtFraction?: number;
+	/** Hard cap on consecutive deferrals between committed compactions. */
+	maxDeferrals?: number;
+	/**
+	 * A task-type transition within this many turns counts as "at a
+	 * boundary" (do not defer; proactive may fire).
+	 */
+	boundaryWindowTurns?: number;
+}
+
 export interface CompactionOptimizerSettings {
 	mode: Mode;
 	hybrid: Required<HybridThresholds>;
 	fileTracker: Required<FileTrackerSettings>;
 	archive: Required<ArchiveSettings>;
+	timing: Required<TimingSettings>;
 }
 
 export const DEFAULTS: CompactionOptimizerSettings = {
@@ -67,11 +113,23 @@ export const DEFAULTS: CompactionOptimizerSettings = {
 	// summarizer otherwise (orphan assistant text, custom instructions, high
 	// message/token count, low tool-call ratio).
 	mode: "hybrid",
+	// Defaults re-grounded in measurement (#244, ADR-0107): pi's threshold
+	// auto-compaction fires at ~0.9 × contextWindow, so the original
+	// maxTokens=60000 / maxOrphanAssistantTokens=2000 guaranteed LLM
+	// fall-through on essentially every real orchestrator compaction. Values
+	// below sit above the measured p90 of real compaction windows on this
+	// host; see the measurement record on #244.
 	hybrid: {
-		maxMessages: 200,
-		maxTokens: 60000,
+		maxMessages: 500,
+		maxTokens: 200_000,
+		maxTokensFraction: 1.0,
 		minToolCallRatio: 0.3,
-		maxOrphanAssistantTokens: 2000,
+		maxOrphanAssistantTokens: 30_000,
+		// Measured (#254): real full-fidelity outputs run 1.6K–7.6K tokens,
+		// and ≤~5K once the Turn Prefix aggregate cap applies. 8000 leaves
+		// every observed real compaction at full fidelity; the ladder only
+		// engages on genuine pathology.
+		maxOutputTokens: 8_000,
 		// 500 chars ≈ 125 tokens. Preserves a flavor of the prior summary for
 		// next-session continuity without re-inlining the full text (which
 		// recursively contains its own prior summary — geometric growth, #253).
@@ -89,6 +147,18 @@ export const DEFAULTS: CompactionOptimizerSettings = {
 		ephemeralBehavior: "skip",
 		redactPatterns: [],
 	},
+	// When-policy (#677, ADR-0109): off by default until measured on-host.
+	// Deferral band exists only where reserveTokens exceeds
+	// (1 − ceiling) × contextWindow — ~3.3K tokens on the 131K omlx
+	// workhorse; see ADR-0109 § Deferral ceiling arithmetic.
+	timing: {
+		enabled: false,
+		providers: ["omlx"],
+		deferCeilingFraction: 0.9,
+		proactiveAtFraction: 0.75,
+		maxDeferrals: 10,
+		boundaryWindowTurns: 1,
+	},
 };
 
 /** Keys the project layer (`<cwd>/.pi/settings.json`) MAY override. */
@@ -96,8 +166,10 @@ const PROJECT_LAYER_ALLOWLIST = new Set<string>([
 	"mode",
 	"hybrid.maxMessages",
 	"hybrid.maxTokens",
+	"hybrid.maxTokensFraction",
 	"hybrid.minToolCallRatio",
 	"hybrid.maxOrphanAssistantTokens",
+	"hybrid.maxOutputTokens",
 	"hybrid.previousSummaryMaxChars",
 	"fileTracker.maxReadFiles",
 	"fileTracker.staleAfterCompactions",
@@ -126,25 +198,50 @@ const PROJECT_LAYER_REJECT = new Set<string>([
 const PROJECT_LAYER_CLAMPS: Record<string, { min?: number; max?: number }> = {
 	"hybrid.maxMessages": { min: 1, max: 2000 },
 	"hybrid.maxTokens": { min: 1, max: 500_000 },
+	"hybrid.maxTokensFraction": { min: 0, max: 5 },
 	"hybrid.minToolCallRatio": { min: 0, max: 1 },
 	"hybrid.maxOrphanAssistantTokens": { min: 0, max: 100_000 },
+	"hybrid.maxOutputTokens": { min: 2_000, max: 100_000 },
 	"hybrid.previousSummaryMaxChars": { min: 0, max: 100_000 },
 	"fileTracker.maxReadFiles": { min: 1, max: 1000 },
 	"fileTracker.staleAfterCompactions": { min: 1, max: 100 },
 };
 
+/** Allowlisted keys that must be booleans (everything clamped must be numeric). */
+const PROJECT_LAYER_BOOLEAN_KEYS = new Set<string>(["archive.enabled"]);
+
+/** The Mode union as a runtime list — settings files are untyped JSON. */
+const VALID_MODES: readonly Mode[] = ["deterministic", "hybrid", "llm-only-with-dump"];
+
+/**
+ * Validate and clamp a project-layer value. `typeRejected: true` means the
+ * value's TYPE is wrong for the key (non-number for a clamped numeric key,
+ * non-boolean for a boolean key, unknown mode string) — such values are
+ * dropped entirely rather than passed through: a passed-through string in a
+ * numeric threshold turns downstream comparisons into NaN math and silently
+ * disables the gate the clamps exist to protect (#781 review finding).
+ */
 function clampProjectValue(
 	key: string,
 	value: unknown,
-): { value: unknown; clamped: boolean } {
+): { value: unknown; clamped: boolean; typeRejected: boolean } {
 	const clamp = PROJECT_LAYER_CLAMPS[key];
-	if (!clamp || typeof value !== "number" || !Number.isFinite(value)) {
-		return { value, clamped: false };
+	if (clamp) {
+		if (typeof value !== "number" || !Number.isFinite(value)) {
+			return { value, clamped: false, typeRejected: true };
+		}
+		let next = value;
+		if (clamp.min !== undefined && next < clamp.min) next = clamp.min;
+		if (clamp.max !== undefined && next > clamp.max) next = clamp.max;
+		return { value: next, clamped: next !== value, typeRejected: false };
 	}
-	let next = value;
-	if (clamp.min !== undefined && next < clamp.min) next = clamp.min;
-	if (clamp.max !== undefined && next > clamp.max) next = clamp.max;
-	return { value: next, clamped: next !== value };
+	if (PROJECT_LAYER_BOOLEAN_KEYS.has(key) && typeof value !== "boolean") {
+		return { value, clamped: false, typeRejected: true };
+	}
+	if (key === "mode" && !VALID_MODES.includes(value as Mode)) {
+		return { value, clamped: false, typeRejected: true };
+	}
+	return { value, clamped: false, typeRejected: false };
 }
 
 export interface NotifyFn {
@@ -284,13 +381,27 @@ export async function loadSettings(opts: LoadOptions): Promise<CompactionOptimiz
 	const projectFiltered: Record<string, unknown> = {};
 	const rejected: string[] = [];
 	const clamped: string[] = [];
+	const typeRejected: string[] = [];
 	for (const [k, v] of projectFlat) {
 		if (PROJECT_LAYER_ALLOWLIST.has(k)) {
-			const { value, clamped: wasClamped } = clampProjectValue(k, v);
+			const { value, clamped: wasClamped, typeRejected: wasTypeRejected } =
+				clampProjectValue(k, v);
+			if (wasTypeRejected) {
+				// Wrong-typed value for an allowlisted key: drop it — never let it
+				// into the merge (#781 review; a string in a numeric threshold
+				// makes downstream comparisons NaN and disables the gate).
+				typeRejected.push(k);
+				continue;
+			}
 			if (wasClamped) clamped.push(k);
 			assignDotted(projectFiltered, k, value);
-		} else if (PROJECT_LAYER_REJECT.has(k) || k.startsWith("archive.")) {
-			// Explicit reject list + any other archive.* key not allowlisted.
+		} else if (
+			PROJECT_LAYER_REJECT.has(k) ||
+			k.startsWith("archive.") ||
+			k.startsWith("timing.")
+		) {
+			// Explicit reject list + any archive.* key not allowlisted + ALL
+			// timing.* keys (user-layer-only when-policy, ADR-0109).
 			rejected.push(k);
 		} else {
 			// Unknown key: drop silently. Forward-compat for keys added by later PRs
@@ -317,12 +428,32 @@ export async function loadSettings(opts: LoadOptions): Promise<CompactionOptimiz
 		}
 	}
 
+	if (typeRejected.length > 0 && opts.notify) {
+		for (const k of typeRejected) {
+			opts.notify(
+				`compaction-optimizer: ignoring project-layer 'extensionSettings.compactionOptimizer.${k}' — wrong value type for this key (defense-in-depth; #781).`,
+				"warning",
+			);
+		}
+	}
+
 	// Merge: defaults <- user <- project (filtered).
 	const merged: Record<string, unknown> = {};
 	deepMerge(merged, userBlock);
 	deepMerge(merged, projectFiltered);
 
-	return materialize(merged);
+	const out = materialize(merged);
+	// Runtime-validate `mode` across BOTH layers: settings files are untyped
+	// JSON, and a typo'd mode would otherwise silently behave like
+	// llm-only-with-dump with no signal (#781 review finding).
+	if (!VALID_MODES.includes(out.mode)) {
+		opts.notify?.(
+			`compaction-optimizer: unknown mode '${String(out.mode)}' — falling back to '${DEFAULTS.mode}'.`,
+			"warning",
+		);
+		out.mode = DEFAULTS.mode;
+	}
+	return out;
 }
 
 /** Public: return a deep clone of DEFAULTS for safe fallback after a load failure. */

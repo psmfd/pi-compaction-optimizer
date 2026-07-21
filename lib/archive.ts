@@ -14,7 +14,8 @@
  *   - Tempfile opened with O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW so
  *     a leaf symlink yields ELOOP and a pre-existing tempfile name fails
  *     EEXIST.
- *   - Pre-existing target refused: explicit fs.access check before rename(2).
+ *   - Pre-existing target refused: link(2) commit (fs.link fails EEXIST on
+ *     an existing target; see the commit site below).
  *   - Failures append a JSON record to `<archive root>/../failure.log` and
  *     never re-raise. Archive write is best-effort.
  *

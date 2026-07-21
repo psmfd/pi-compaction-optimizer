@@ -59,14 +59,79 @@ export interface BuildInput {
 	customInstructionsDropped: boolean;
 }
 
-const GOAL_MAX_CHARS = 500;
-
 /**
  * Default cap on re-inlined `previousSummary` chars when `BuildInput` does
  * not specify one. Mirrors `DEFAULTS.hybrid.previousSummaryMaxChars` in
- * `settings.ts`; kept in sync by `settings.test.ts`. (#253)
+ * `settings.ts`; the sync is asserted by a cross-import test in
+ * `settings.test.ts`. Production dispatch always threads the Required
+ * setting, so this fallback is reachable only by direct unit-test callers
+ * of the builder. (#253, #781)
  */
 export const DEFAULT_PREVIOUS_SUMMARY_MAX_CHARS = 500;
+
+// ---------------------------------------------------------------------------
+// Shrink ladder (#254, ADR-0108)
+//
+// The builder renders at one of N fidelity rungs. Rungs are CUMULATIVE: each
+// rung applies every drop of the rungs before it. The dispatcher walks
+// RUNG_ORDER until the rendered output fits `hybrid.maxOutputTokens`
+// (first-fit short-circuit). Every rung is a pure function of
+// (input, rung) — byte-identical output for identical input, per the same
+// determinism contract the full render has always carried.
+// ---------------------------------------------------------------------------
+
+export type Rung =
+	| "full"
+	| "no-file-activity"
+	| "no-tools"
+	| "no-verdict-brief"
+	| "no-prefix"
+	| "no-carried-forward"
+	| "trimmed-turns"
+	| "stub";
+
+export const RUNG_ORDER: readonly Rung[] = [
+	"full",
+	"no-file-activity",
+	"no-tools",
+	"no-verdict-brief",
+	"no-prefix",
+	"no-carried-forward",
+	"trimmed-turns",
+	"stub",
+] as const;
+
+/**
+ * chars/4 token estimate of a rendered summary — the OUTPUT-side counterpart
+ * of `estimateTokens` (which takes an AgentMessage). Single home for the
+ * convention so the dispatcher's budget check and tests share one estimator.
+ */
+export function estimateSummaryTokens(summary: string): number {
+	return Math.ceil(summary.length / 4);
+}
+
+/**
+ * Rendering caps, named per the file's existing USER_TURN_MAX_CHARS convention
+ * (#254 promoted the former inline literals). Definitional properties of the
+ * renderer, not settings — deliberately not operator-tunable (same rationale
+ * as RATIO_CHECK_MIN_MESSAGES in hybrid.ts; recorded in ADR-0108).
+ */
+const SUBAGENT_BRIEF_EXCERPT_MAX_CHARS = 120;
+const TURN_PREFIX_MSG_MAX_CHARS = 1000;
+const BASH_LAST_COMMAND_MAX_CHARS = 80;
+/**
+ * Aggregate bound on the Turn Prefix section: only the LAST N prefix
+ * messages render (earlier ones elided with a deterministic marker). The
+ * per-message char cap alone left the section unbounded in message count —
+ * the dominant tail section in on-host measurement (5.7K tokens of a 7.6K
+ * summary on the largest observed compaction; #254 measurement record).
+ */
+const TURN_PREFIX_MAX_MESSAGES = 12;
+/** trimmed-turns rung: per-turn char cap and kept-turn count (first + last K-1). */
+const TRIMMED_USER_TURN_MAX_CHARS = 500;
+const TRIMMED_USER_TURNS_KEEP = 10;
+/** stub rung: first turn + last N turns. */
+const STUB_USER_TURNS_KEEP_LAST = 2;
 
 /**
  * Deterministic marker appended when `previousSummary` is truncated. Byte-
@@ -223,7 +288,10 @@ function extractSubagentVerdicts(messages: AgentMessage[]): SubagentVerdict[] {
 		if (m.role !== "toolResult" || m.toolName !== "subagent") continue;
 		const text = textOf(msg);
 		const agents = agentsByCallId.get(String(m.toolCallId ?? "")) ?? ["<unknown>"];
-		const briefExcerpt = truncate(text.replace(/\s+/g, " ").trim(), 120);
+		const briefExcerpt = truncate(
+			text.replace(/\s+/g, " ").trim(),
+			SUBAGENT_BRIEF_EXCERPT_MAX_CHARS,
+		);
 
 		// Preferred path: split the toolResult into per-task segments using the
 		// `### [<agent>] <status>` headers the subagent extension emits in
@@ -381,18 +449,57 @@ export function toolCallCount(messages: AgentMessage[]): number {
 /** Per-turn body cap for user messages in the deterministic summary. */
 const USER_TURN_MAX_CHARS = 2000;
 
-function renderUserTurns(messages: AgentMessage[]): string[] {
+/**
+ * Render the User Turns section at one of three fidelity levels (ADR-0108).
+ *
+ * - `all` — every turn, USER_TURN_MAX_CHARS per turn (original behavior).
+ * - `trimmed` — turn #1 plus the last TRIMMED_USER_TURNS_KEEP-1 turns at
+ *   TRIMMED_USER_TURN_MAX_CHARS each. Turn #1 is always preserved: the
+ *   `## Goal` section it used to duplicate was removed as unconditional
+ *   dedup, so the first turn is the only remaining carrier of the
+ *   original ask.
+ * - `stub` — turn #1 plus the last STUB_USER_TURNS_KEEP_LAST turns.
+ *
+ * Elided ranges render a deterministic marker with the elided count.
+ * Degrades gracefully at 0/1 available turns (no padding, no error).
+ */
+function renderUserTurns(
+	messages: AgentMessage[],
+	level: "all" | "trimmed" | "stub",
+): string[] {
 	const lines: string[] = ["## User Turns (verbatim)", ""];
-	let ord = 0;
-	let found = false;
+	const turns: string[] = [];
 	for (const msg of messages) {
 		if ((msg as { role: string }).role !== "user") continue;
-		ord += 1;
-		found = true;
-		const body = truncate(textOf(msg).trim(), USER_TURN_MAX_CHARS);
+		turns.push(textOf(msg).trim());
+	}
+	if (turns.length === 0) {
+		lines.push("(none)");
+		lines.push("");
+		return lines;
+	}
+	const maxChars =
+		level === "all" ? USER_TURN_MAX_CHARS : TRIMMED_USER_TURN_MAX_CHARS;
+	const keepLast =
+		level === "all"
+			? turns.length
+			: level === "trimmed"
+				? TRIMMED_USER_TURNS_KEEP - 1
+				: STUB_USER_TURNS_KEEP_LAST;
+	// Kept ordinals: always #1, plus the last `keepLast` turns (1-based).
+	const lastStart = Math.max(turns.length - keepLast, 1);
+	for (let i = 0; i < turns.length; i++) {
+		const ord = i + 1;
+		if (ord !== 1 && ord <= lastStart) {
+			// Emit one elision marker at the start of the skipped range.
+			if (ord === 2) {
+				lines.push(`_(… ${lastStart - 1} earlier turn${lastStart - 1 === 1 ? "" : "s"} elided …)_`);
+			}
+			continue;
+		}
+		const body = truncate(turns[i], maxChars);
 		lines.push(`${ord}. ${body.length > 0 ? body : "(empty user message)"}`);
 	}
-	if (!found) lines.push("(none)");
 	lines.push("");
 	return lines;
 }
@@ -429,7 +536,7 @@ function renderToolActivity(messages: AgentMessage[]): string[] {
 	for (const a of acts) {
 		const suffix =
 			a.lastBashCommand !== undefined
-				? ` (last: \`${a.lastBashCommand.replace(/\\/g, "\\\\").replace(/`/g, "\\`")}\`)`
+				? ` (last: \`${truncate(a.lastBashCommand, BASH_LAST_COMMAND_MAX_CHARS).replace(/\\/g, "\\\\").replace(/`/g, "\\`")}\`)`
 				: "";
 		lines.push(`- \`${a.name}\`: ${a.count} invocation${a.count === 1 ? "" : "s"}${suffix}`);
 	}
@@ -437,7 +544,20 @@ function renderToolActivity(messages: AgentMessage[]): string[] {
 	return lines;
 }
 
-function renderSubagentVerdicts(messages: AgentMessage[]): string[] {
+/**
+ * Render the Subagent Verdicts table at one of three fidelity levels
+ * (ADR-0108):
+ *
+ * - `full` — `| Agent | Verdict | Brief |` where Brief is REPORT_FILE when
+ *   present, else the excerpt (original behavior).
+ * - `no-brief` — `| Agent | Verdict | Ref |` where Ref is REPORT_FILE when
+ *   present, else `—`; the excerpt is dropped.
+ * - `stub` — `| Agent | Verdict |` only.
+ */
+function renderSubagentVerdicts(
+	messages: AgentMessage[],
+	level: "full" | "no-brief" | "stub",
+): string[] {
 	const verdicts = extractSubagentVerdicts(messages);
 	const lines: string[] = ["## Subagent Verdicts", ""];
 	if (verdicts.length === 0) {
@@ -445,58 +565,105 @@ function renderSubagentVerdicts(messages: AgentMessage[]): string[] {
 		lines.push("");
 		return lines;
 	}
-	lines.push("| Agent | Verdict | Brief |");
-	lines.push("|---|---|---|");
-	for (const v of verdicts) {
-		const brief = v.reportFile ? `REPORT_FILE: ${v.reportFile}` : v.briefExcerpt;
-		// Escape pipe AND backtick characters to keep table cells well-formed
-		// even when an LLM-emitted agent name or REPORT_FILE path contains them.
-		const escape = (s: string): string => s.replace(/[`|]/g, (c) => `\\${c}`);
-		lines.push(`| \`${escape(v.agent)}\` | ${v.verdict} | ${escape(brief)} |`);
+	// Escape pipe AND backtick characters to keep table cells well-formed
+	// even when an LLM-emitted agent name or REPORT_FILE path contains them.
+	const escape = (s: string): string => s.replace(/[`|]/g, (c) => `\\${c}`);
+	if (level === "stub") {
+		lines.push("| Agent | Verdict |");
+		lines.push("|---|---|");
+		for (const v of verdicts) {
+			lines.push(`| \`${escape(v.agent)}\` | ${v.verdict} |`);
+		}
+	} else if (level === "no-brief") {
+		lines.push("| Agent | Verdict | Ref |");
+		lines.push("|---|---|---|");
+		for (const v of verdicts) {
+			const ref = v.reportFile ? escape(v.reportFile) : "—";
+			lines.push(`| \`${escape(v.agent)}\` | ${v.verdict} | ${ref} |`);
+		}
+	} else {
+		lines.push("| Agent | Verdict | Brief |");
+		lines.push("|---|---|---|");
+		for (const v of verdicts) {
+			const brief = v.reportFile ? `REPORT_FILE: ${v.reportFile}` : v.briefExcerpt;
+			lines.push(`| \`${escape(v.agent)}\` | ${v.verdict} | ${escape(brief)} |`);
+		}
 	}
 	lines.push("");
 	return lines;
 }
 
-function renderGoal(messages: AgentMessage[]): string[] {
-	for (const msg of messages) {
-		if ((msg as { role: string }).role !== "user") continue;
-		const t = textOf(msg).trim();
-		if (t.length === 0) continue;
-		return ["## Goal", "", truncate(t, GOAL_MAX_CHARS), ""];
-	}
-	return ["## Goal", "", "(no user message in summarized span)", ""];
-}
+// `## Goal` was removed as unconditional dedup (#254, ADR-0108): it
+// duplicated User Turns #1, which every fidelity level of renderUserTurns
+// preserves. The first user turn is the sole carrier of the original ask.
 
 function renderTurnPrefix(messages: AgentMessage[]): string[] {
 	if (messages.length === 0) return [];
 	const lines: string[] = ["## Turn Prefix (split turn)", ""];
-	let ord = 0;
-	for (const msg of messages) {
+	// Aggregate bound (ADR-0108): only the last TURN_PREFIX_MAX_MESSAGES
+	// prefix messages render; the per-message char cap alone left this
+	// section unbounded in message count.
+	const start = Math.max(messages.length - TURN_PREFIX_MAX_MESSAGES, 0);
+	if (start > 0) {
+		lines.push(`_(… ${start} earlier prefix message${start === 1 ? "" : "s"} elided …)_`);
+	}
+	for (let i = start; i < messages.length; i++) {
+		const msg = messages[i];
 		const role = (msg as { role: string }).role;
-		ord += 1;
-		const body = truncate(textOf(msg).trim(), 1000);
-		lines.push(`${ord}. **${role}** — ${body.length > 0 ? body : "(empty)"}`);
+		const body = truncate(textOf(msg).trim(), TURN_PREFIX_MSG_MAX_CHARS);
+		lines.push(`${i + 1}. **${role}** — ${body.length > 0 ? body : "(empty)"}`);
 	}
 	lines.push("");
 	return lines;
 }
 
+/** Per-rung render configuration, derived cumulatively from RUNG_ORDER. */
+interface RungConfig {
+	fileActivity: boolean;
+	toolActivity: boolean;
+	verdictLevel: "full" | "no-brief" | "stub";
+	turnPrefix: boolean;
+	carriedForward: boolean;
+	userTurnLevel: "all" | "trimmed" | "stub";
+	instructionsFooter: boolean;
+}
+
+function rungConfig(rung: Rung): RungConfig {
+	const i = RUNG_ORDER.indexOf(rung);
+	const at = (r: Rung): boolean => i >= RUNG_ORDER.indexOf(r);
+	return {
+		fileActivity: !at("no-file-activity"),
+		toolActivity: !at("no-tools"),
+		verdictLevel: at("stub") ? "stub" : at("no-verdict-brief") ? "no-brief" : "full",
+		turnPrefix: !at("no-prefix"),
+		carriedForward: !at("no-carried-forward"),
+		userTurnLevel: at("stub") ? "stub" : at("trimmed-turns") ? "trimmed" : "all",
+		instructionsFooter: !at("stub"),
+	};
+}
+
 /**
- * Build the deterministic markdown summary. Byte-identical for identical
- * input — including `generatedAt`.
+ * Build the deterministic markdown summary at a fidelity rung (#254,
+ * ADR-0108). Pure: byte-identical output for identical (input, rung) —
+ * including `generatedAt`. `## Compaction Metadata` survives every rung.
  */
-export function buildDeterministicSummary(input: BuildInput): string {
+export function buildAtRung(input: BuildInput, rung: Rung): string {
+	const cfg = rungConfig(rung);
 	const lines: string[] = [];
 
-	lines.push(...renderGoal(input.messagesToSummarize));
-	lines.push(...renderUserTurns(input.messagesToSummarize));
-	if (input.isSplitTurn) lines.push(...renderTurnPrefix(input.turnPrefixMessages));
-	lines.push(...renderFileActivity(input.fileOps));
-	lines.push(...renderToolActivity(input.messagesToSummarize));
-	lines.push(...renderSubagentVerdicts(input.messagesToSummarize));
+	lines.push(...renderUserTurns(input.messagesToSummarize, cfg.userTurnLevel));
+	if (cfg.turnPrefix && input.isSplitTurn) {
+		lines.push(...renderTurnPrefix(input.turnPrefixMessages));
+	}
+	if (cfg.fileActivity) lines.push(...renderFileActivity(input.fileOps));
+	if (cfg.toolActivity) lines.push(...renderToolActivity(input.messagesToSummarize));
+	lines.push(...renderSubagentVerdicts(input.messagesToSummarize, cfg.verdictLevel));
 
-	if (input.previousSummary && input.previousSummary.trim().length > 0) {
+	if (
+		cfg.carriedForward &&
+		input.previousSummary &&
+		input.previousSummary.trim().length > 0
+	) {
 		const cap =
 			input.previousSummaryMaxChars ?? DEFAULT_PREVIOUS_SUMMARY_MAX_CHARS;
 		// cap === 0 → omit the section entirely (archive remains the canonical
@@ -524,7 +691,7 @@ export function buildDeterministicSummary(input: BuildInput): string {
 	lines.push(`- generated_at: ${input.generatedAt}`);
 	lines.push("");
 
-	if (input.customInstructionsDropped) {
+	if (cfg.instructionsFooter && input.customInstructionsDropped) {
 		lines.push(
 			"> NOTE: `/compact <instructions>` were not honored in deterministic mode. " +
 				"Switch to `mode: \"hybrid\"` or `\"llm-only-with-dump\"` to use custom instructions.",
@@ -533,4 +700,12 @@ export function buildDeterministicSummary(input: BuildInput): string {
 	}
 
 	return lines.join("\n");
+}
+
+/**
+ * Full-fidelity build — backward-compatible wrapper over `buildAtRung`.
+ * Byte-identical for identical input, including `generatedAt`.
+ */
+export function buildDeterministicSummary(input: BuildInput): string {
+	return buildAtRung(input, "full");
 }

@@ -53,6 +53,178 @@ test("defaults materialize when both layers are silent", async () => {
 	}
 });
 
+test("defaults expose measured hybrid thresholds (#244, ADR-0107)", async () => {
+	const { cwd, userPath, cleanup } = await setupLayers({});
+	try {
+		const out = await loadSettings({ cwd, userSettingsPath: userPath });
+		assert.equal(out.hybrid.maxMessages, 500);
+		assert.equal(out.hybrid.maxTokens, 200_000);
+		assert.equal(out.hybrid.maxTokensFraction, 1.0);
+		assert.equal(out.hybrid.minToolCallRatio, 0.3);
+		assert.equal(out.hybrid.maxOrphanAssistantTokens, 30_000);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("defaults expose timing.* off-by-default when-policy (#677, ADR-0109)", async () => {
+	const { cwd, userPath, cleanup } = await setupLayers({});
+	try {
+		const out = await loadSettings({ cwd, userSettingsPath: userPath });
+		assert.equal(out.timing.enabled, false);
+		assert.deepEqual(out.timing.providers, ["omlx"]);
+		assert.equal(out.timing.deferCeilingFraction, 0.9);
+		assert.equal(out.timing.proactiveAtFraction, 0.75);
+		assert.equal(out.timing.maxDeferrals, 10);
+		assert.equal(out.timing.boundaryWindowTurns, 1);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("user layer may enable timing.*; project layer is rejected wholesale (ADR-0109)", async () => {
+	const cap = captureNotify();
+	const { cwd, userPath, cleanup } = await setupLayers({
+		user: {
+			extensionSettings: {
+				compactionOptimizer: { timing: { enabled: true, maxDeferrals: 3 } },
+			},
+		},
+		project: {
+			extensionSettings: {
+				compactionOptimizer: { timing: { enabled: false, providers: ["evil"] } },
+			},
+		},
+	});
+	try {
+		const out = await loadSettings({ cwd, userSettingsPath: userPath, notify: cap.notify });
+		assert.equal(out.timing.enabled, true, "user layer wins; project rejected");
+		assert.equal(out.timing.maxDeferrals, 3);
+		assert.deepEqual(out.timing.providers, ["omlx"], "project providers rejected");
+		const warnings = cap.calls.filter((c) => c.type === "warning");
+		assert.ok(
+			warnings.some((c) => c.message.includes("timing.enabled")),
+			`expected reject notify for timing.enabled; got ${JSON.stringify(warnings)}`,
+		);
+		assert.ok(warnings.some((c) => c.message.includes("timing.providers")));
+	} finally {
+		await cleanup();
+	}
+});
+
+test("DEFAULT_PREVIOUS_SUMMARY_MAX_CHARS stays in sync with DEFAULTS (#253, #781)", async () => {
+	const { DEFAULT_PREVIOUS_SUMMARY_MAX_CHARS } = await import("../lib/deterministic-summary.ts");
+	assert.equal(DEFAULT_PREVIOUS_SUMMARY_MAX_CHARS, DEFAULTS.hybrid.previousSummaryMaxChars);
+});
+
+test("project-layer wrong-typed values for allowlisted keys are dropped with notify (#781)", async () => {
+	const cap = captureNotify();
+	const { cwd, userPath, cleanup } = await setupLayers({
+		project: {
+			extensionSettings: {
+				compactionOptimizer: {
+					mode: "hybird",
+					hybrid: { maxTokens: "not-a-number" },
+					archive: { enabled: "false" },
+				},
+			},
+		},
+	});
+	try {
+		const out = await loadSettings({ cwd, userSettingsPath: userPath, notify: cap.notify });
+		assert.equal(out.hybrid.maxTokens, 200_000, "string maxTokens must not reach the merge");
+		assert.equal(out.archive.enabled, true, "string 'false' must not reach archive.enabled");
+		assert.equal(out.mode, "hybrid", "typo'd project mode must be dropped");
+		const warnings = cap.calls.filter((c) => c.type === "warning");
+		assert.ok(warnings.some((c) => c.message.includes("hybrid.maxTokens") && c.message.includes("wrong value type")));
+		assert.ok(warnings.some((c) => c.message.includes("archive.enabled") && c.message.includes("wrong value type")));
+		assert.ok(warnings.some((c) => c.message.includes("mode") && c.message.includes("wrong value type")));
+	} finally {
+		await cleanup();
+	}
+});
+
+test("user-layer unknown mode falls back to default with notify (#781)", async () => {
+	const cap = captureNotify();
+	const { cwd, userPath, cleanup } = await setupLayers({
+		user: {
+			extensionSettings: { compactionOptimizer: { mode: "hybird" } },
+		},
+	});
+	try {
+		const out = await loadSettings({ cwd, userSettingsPath: userPath, notify: cap.notify });
+		assert.equal(out.mode, "hybrid");
+		assert.ok(
+			cap.calls.some((c) => c.type === "warning" && /unknown mode 'hybird'/.test(c.message)),
+			`expected unknown-mode notify; got ${JSON.stringify(cap.calls)}`,
+		);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("defaults expose hybrid.maxOutputTokens=8000 (#254, ADR-0108)", async () => {
+	const { cwd, userPath, cleanup } = await setupLayers({});
+	try {
+		const out = await loadSettings({ cwd, userSettingsPath: userPath });
+		assert.equal(out.hybrid.maxOutputTokens, 8_000);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("project layer can set hybrid.maxOutputTokens; clamped to [2000, 100000] (ADR-0108)", async () => {
+	const cap = captureNotify();
+	const { cwd, userPath, cleanup } = await setupLayers({
+		project: {
+			extensionSettings: {
+				compactionOptimizer: {
+					hybrid: { maxOutputTokens: 1 },
+				},
+			},
+		},
+	});
+	try {
+		const out = await loadSettings({ cwd, userSettingsPath: userPath, notify: cap.notify });
+		assert.equal(out.hybrid.maxOutputTokens, 2_000);
+		const warnings = cap.calls.filter((c) => c.type === "warning");
+		assert.ok(
+			warnings.some(
+				(c) => c.message.includes("hybrid.maxOutputTokens") && c.message.includes("clamped"),
+			),
+			`expected clamp notify for hybrid.maxOutputTokens; got ${JSON.stringify(warnings)}`,
+		);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("project layer can set hybrid.maxTokensFraction; clamped to [0, 5] (ADR-0107)", async () => {
+	const cap = captureNotify();
+	const { cwd, userPath, cleanup } = await setupLayers({
+		project: {
+			extensionSettings: {
+				compactionOptimizer: {
+					hybrid: { maxTokensFraction: 99 },
+				},
+			},
+		},
+	});
+	try {
+		const out = await loadSettings({ cwd, userSettingsPath: userPath, notify: cap.notify });
+		assert.equal(out.hybrid.maxTokensFraction, 5);
+		const warnings = cap.calls.filter((c) => c.type === "warning");
+		assert.ok(
+			warnings.some(
+				(c) => c.message.includes("hybrid.maxTokensFraction") && c.message.includes("clamped"),
+			),
+			`expected clamp notify for hybrid.maxTokensFraction; got ${JSON.stringify(warnings)}`,
+		);
+	} finally {
+		await cleanup();
+	}
+});
+
 test("user layer accepts absolute archive.path", async () => {
 	const abs = "/var/tmp/some-archive";
 	const { cwd, userPath, cleanup } = await setupLayers({
