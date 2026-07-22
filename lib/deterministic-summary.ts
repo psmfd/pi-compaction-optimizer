@@ -225,8 +225,15 @@ export function estimateTokens(msg: AgentMessage): number {
  * canonical form. PR2 plan Q2 explicitly chose permissive over strict. The
  * `g` + `i` + `m` flags drive `matchAll` so we surface every verdict in a
  * single aggregated parallel-subagent toolResult (not just the first).
+ *
+ * Backtracking safety: the input is unbounded subagent-transcript text, so the
+ * separator structure must stay unambiguous — each optional separator group
+ * requires its distinguishing character (`(?:[ \t]*:)?`, `(?:[ \t]*\*{1,2})?`)
+ * so a long whitespace run has exactly one parse. Adjacent bare `\s*` runs
+ * around the optional colon/stars were polynomial on `"Verdict" + " "×N`
+ * (CodeQL js/polynomial-redos, pi-compaction-optimizer alert #3).
  */
-const VERDICT_RE = /^\s*(?:\*{0,2})?Verdict(?:\*{0,2})?\s*:?\s*\*{0,2}\s*(PASS|PASS_WITH_WARNINGS|NEEDS_CHANGES|PRECONDITION_FAILURE)\b/gim;
+const VERDICT_RE = /^[ \t]*\*{0,2}Verdict\*{0,2}(?:[ \t]*:)?(?:[ \t]*\*{1,2})?[ \t]*(PASS|PASS_WITH_WARNINGS|NEEDS_CHANGES|PRECONDITION_FAILURE)\b/gim;
 const REPORT_FILE_RE = /^\s*REPORT_FILE:\s*(\S+)/gim;
 const AGENT_ARG_KEYS = ["agent", "agentName", "name"] as const;
 // Per-task header emitted by the vendored subagent extension in parallel

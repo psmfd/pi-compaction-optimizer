@@ -798,3 +798,57 @@ test("buildDeterministicSummary === buildAtRung(input, 'full') (back-compat wrap
 	const input = richInput();
 	assert.equal(buildDeterministicSummary(input), buildAtRung(input, "full"));
 });
+
+// -----------------------------------------------------------------------------
+// VERDICT_RE backtracking safety (CodeQL js/polynomial-redos, mirror alert #3).
+// The regex scans unbounded subagent-transcript text; the separator structure
+// must keep a long whitespace run to a single parse. These tests pin (a) form
+// parity for the rewritten separators and (b) linear-time behavior on the
+// adversarial input that was polynomial under the old adjacent-`\s*` shape.
+// -----------------------------------------------------------------------------
+
+test("verdict extraction: separator form parity (space-before-colon, bold value, no-space colon)", () => {
+	const out = buildDeterministicSummary({
+		messagesToSummarize: [
+			userMsg("/review"),
+			assistantToolCall("subagent", { agent: "spaced-colon" }, "tc-f1"),
+			toolResult("subagent", "tc-f1", "Verdict : PASS"),
+			assistantToolCall("subagent", { agent: "bold-value" }, "tc-f2"),
+			toolResult("subagent", "tc-f2", "Verdict: **NEEDS_CHANGES**"),
+			assistantToolCall("subagent", { agent: "tight-colon" }, "tc-f3"),
+			toolResult("subagent", "tc-f3", "Verdict:PASS_WITH_WARNINGS"),
+		] as never,
+		turnPrefixMessages: [] as never,
+		isSplitTurn: false,
+		fileOps: emptyFileOps(),
+		tokensBefore: 0,
+		generatedAt: "2026-01-01T00:00:00.000Z",
+		customInstructionsDropped: false,
+	});
+	assert.match(out, /spaced-colon.*PASS/);
+	assert.match(out, /bold-value.*NEEDS_CHANGES/);
+	assert.match(out, /tight-colon.*PASS_WITH_WARNINGS/);
+});
+
+test("verdict extraction: 'Verdict' + long whitespace run without a verdict completes fast (ReDoS)", () => {
+	// Old regex: three ambiguous adjacent `\s*` runs -> O(N^2) splits on this
+	// input (N = 100_000 hangs for minutes). New regex parses it once.
+	const attack = `prelude\nVerdict${" ".repeat(100_000)}not-a-verdict\n`;
+	const started = Date.now();
+	const out = buildDeterministicSummary({
+		messagesToSummarize: [
+			userMsg("go"),
+			assistantToolCall("subagent", { agent: "hostile" }, "tc-redos"),
+			toolResult("subagent", "tc-redos", attack),
+		] as never,
+		turnPrefixMessages: [] as never,
+		isSplitTurn: false,
+		fileOps: emptyFileOps(),
+		tokensBefore: 0,
+		generatedAt: "2026-01-01T00:00:00.000Z",
+		customInstructionsDropped: false,
+	});
+	const elapsed = Date.now() - started;
+	assert.ok(elapsed < 2_000, `verdict scan must be linear-time; took ${elapsed}ms`);
+	assert.ok(!/hostile.*(PASS|NEEDS_CHANGES)/.test(out), "no phantom verdict row from the attack string");
+});
