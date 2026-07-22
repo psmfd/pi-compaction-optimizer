@@ -36,13 +36,6 @@
           "default": 50,
           "description": "Cap on the size of preparation.fileOps.read after pruning. Excess entries are evicted in insertion order, keeping the most recent N. modifiedFiles is never pruned."
         },
-        "staleAfterCompactions": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 100,
-          "default": 3,
-          "description": "Reserved for future use; PR1 does not surface per-file age, so this key is informational only."
-        },
         "dropPatterns": {
           "type": "array",
           "items": { "type": "string" },
@@ -62,6 +55,14 @@
         "proactiveAtFraction": { "type": "number", "minimum": 0.1, "maximum": 1.0, "default": 0.75, "description": "Usage fraction at which a fresh task-type boundary (agent settled, no fan-out in flight) may trigger a proactive ctx.compact()." },
         "maxDeferrals": { "type": "integer", "minimum": 1, "maximum": 100, "default": 10 },
         "boundaryWindowTurns": { "type": "integer", "minimum": 0, "maximum": 20, "default": 1, "description": "A task-type transition within this many turns counts as 'at a boundary' (never defer; proactive may fire)." }
+      }
+    },
+    "events": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Per-compaction metrics ledger (#838, ADR-0117): one JSONL record per committed compaction, appended to ~/.pi/agent/extensions/compaction-optimizer/events.jsonl. Observational only — never influences dispatch, never blocks a compaction on write failure. Report via scripts/compaction-metrics.sh.",
+      "properties": {
+        "enabled": { "type": "boolean", "default": true }
       }
     },
     "archive": {

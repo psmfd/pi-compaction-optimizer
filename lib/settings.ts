@@ -54,8 +54,6 @@ export interface HybridThresholds {
 export interface FileTrackerSettings {
 	/** Cap on number of read-only file paths retained per compaction. */
 	maxReadFiles?: number;
-	/** Drop read files older than N compactions (currently informational). */
-	staleAfterCompactions?: number;
 	/** Path-pattern filters; files matching any pattern are dropped from `read`. */
 	dropPatterns?: string[];
 }
@@ -99,12 +97,23 @@ export interface TimingSettings {
 	boundaryWindowTurns?: number;
 }
 
+/**
+ * Per-compaction metrics ledger (#838, ADR-0117): one JSONL record per
+ * committed compaction to `events.jsonl`. Observational only — the emitter
+ * never influences dispatch and never blocks a compaction on write failure.
+ */
+export interface EventsSettings {
+	/** Master switch for the events.jsonl emitter. Default true. */
+	enabled?: boolean;
+}
+
 export interface CompactionOptimizerSettings {
 	mode: Mode;
 	hybrid: Required<HybridThresholds>;
 	fileTracker: Required<FileTrackerSettings>;
 	archive: Required<ArchiveSettings>;
 	timing: Required<TimingSettings>;
+	events: Required<EventsSettings>;
 }
 
 export const DEFAULTS: CompactionOptimizerSettings = {
@@ -138,7 +147,6 @@ export const DEFAULTS: CompactionOptimizerSettings = {
 	},
 	fileTracker: {
 		maxReadFiles: 50,
-		staleAfterCompactions: 3,
 		dropPatterns: [],
 	},
 	archive: {
@@ -159,6 +167,11 @@ export const DEFAULTS: CompactionOptimizerSettings = {
 		maxDeferrals: 10,
 		boundaryWindowTurns: 1,
 	},
+	// Metrics ledger (#838, ADR-0117): on by default — a few hundred bytes per
+	// compaction, no model calls, no dispatch influence.
+	events: {
+		enabled: true,
+	},
 };
 
 /** Keys the project layer (`<cwd>/.pi/settings.json`) MAY override. */
@@ -172,8 +185,8 @@ const PROJECT_LAYER_ALLOWLIST = new Set<string>([
 	"hybrid.maxOutputTokens",
 	"hybrid.previousSummaryMaxChars",
 	"fileTracker.maxReadFiles",
-	"fileTracker.staleAfterCompactions",
 	"archive.enabled",
+	"events.enabled",
 ]);
 
 /** Keys the project layer MUST NOT override (rejected with notify). */
@@ -204,11 +217,10 @@ const PROJECT_LAYER_CLAMPS: Record<string, { min?: number; max?: number }> = {
 	"hybrid.maxOutputTokens": { min: 2_000, max: 100_000 },
 	"hybrid.previousSummaryMaxChars": { min: 0, max: 100_000 },
 	"fileTracker.maxReadFiles": { min: 1, max: 1000 },
-	"fileTracker.staleAfterCompactions": { min: 1, max: 100 },
 };
 
 /** Allowlisted keys that must be booleans (everything clamped must be numeric). */
-const PROJECT_LAYER_BOOLEAN_KEYS = new Set<string>(["archive.enabled"]);
+const PROJECT_LAYER_BOOLEAN_KEYS = new Set<string>(["archive.enabled", "events.enabled"]);
 
 /** The Mode union as a runtime list — settings files are untyped JSON. */
 const VALID_MODES: readonly Mode[] = ["deterministic", "hybrid", "llm-only-with-dump"];

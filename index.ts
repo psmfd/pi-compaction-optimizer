@@ -49,6 +49,12 @@ import {
 } from "./lib/deterministic-summary.ts";
 import { decideHybrid } from "./lib/hybrid.ts";
 import { decideDefer, decideProactive } from "./lib/timing.ts";
+import {
+	appendEvent,
+	buildEventRecord,
+	policyTag,
+	type PendingEvent,
+} from "./lib/events.ts";
 import * as phaseState from "./shared/phase-state.ts";
 
 // Loose typing for the extension API — pi types are sourced from the runtime
@@ -58,13 +64,24 @@ type Pi = any;
 
 const MODE_NOTIFY_SENT = new Set<string>();
 
+/**
+ * Metrics ledger hand-off (#838, ADR-0117): `session_before_compact` stashes
+ * the dispatch outcome here; `session_compact` completes and appends it. Keyed
+ * by session id, same lifecycle as the snapshot map — a cancelled compaction
+ * never commits, so its pending entry is simply overwritten by the next fire
+ * (or dropped at shutdown). One slot per session: pi runs one compaction at a
+ * time per session.
+ */
+const PENDING_EVENTS = new Map<string, PendingEvent>();
+
 function clearNotifyForSession(sessionId: string): void {
 	// Covers every notifyOnce key family for the session: `mode:<sid>:*`
-	// (mode-dispatch one-shots) and `defer:<sid>:*` (when-policy toasts) —
-	// the latter are normally re-armed on a committed compaction, but a
+	// (mode-dispatch one-shots), `defer:<sid>:*` (when-policy toasts), and
+	// `events:<sid>:*` (metrics-ledger append-failure warnings, #838) — the
+	// defer keys are normally re-armed on a committed compaction, but a
 	// session that shuts down mid-deferral-episode would otherwise leak
 	// them in this process-lifetime Set (#781 review finding).
-	for (const prefix of [`mode:${sessionId}:`, `defer:${sessionId}:`]) {
+	for (const prefix of [`mode:${sessionId}:`, `defer:${sessionId}:`, `events:${sessionId}:`]) {
 		for (const key of MODE_NOTIFY_SENT) {
 			if (key.startsWith(prefix)) MODE_NOTIFY_SENT.delete(key);
 		}
@@ -77,11 +94,34 @@ function clearNotifyForSession(sessionId: string): void {
  * drift (#781 review finding). `contextWindow` is 0 when unknown — every
  * consumer treats non-positive as "window unknown" and fails open.
  */
-function modelInfoOf(ctx: Pi): { provider: string | undefined; contextWindow: number } {
-	const model = (ctx as { model?: { provider?: unknown; contextWindow?: unknown } })?.model;
+function modelInfoOf(ctx: Pi): {
+	provider: string | undefined;
+	contextWindow: number;
+	/** Model id, for the metrics ledger (#838). */
+	id: string | undefined;
+	/** Per-MTok input/output rates from `ctx.model.cost`, when present. */
+	rates: { inputPerMTok: number; outputPerMTok: number } | undefined;
+} {
+	const model = (
+		ctx as {
+			model?: {
+				provider?: unknown;
+				contextWindow?: unknown;
+				id?: unknown;
+				cost?: { input?: unknown; output?: unknown };
+			};
+		}
+	)?.model;
+	const costIn = Number(model?.cost?.input ?? Number.NaN);
+	const costOut = Number(model?.cost?.output ?? Number.NaN);
 	return {
 		provider: typeof model?.provider === "string" ? model.provider : undefined,
 		contextWindow: Number(model?.contextWindow ?? 0),
+		id: typeof model?.id === "string" ? model.id : undefined,
+		rates:
+			Number.isFinite(costIn) && Number.isFinite(costOut) && (costIn > 0 || costOut > 0)
+				? { inputPerMTok: costIn, outputPerMTok: costOut }
+				: undefined,
 	};
 }
 
@@ -162,6 +202,300 @@ function formatPathNotify(opts: {
 	return `compaction-optimizer: deferred to pi LLM summarizer (mode=${opts.mode}); archive will capture raw payload`;
 }
 
+/**
+ * Step 0 — when-policy veto (#677, ADR-0109), extracted from the
+ * session_before_compact handler (#783) so the decision wiring is
+ * unit-testable without the fake-pi event bus. MUST run before the
+ * file-tracker prune and snapshot capture: both are wasted work on a
+ * deferred fire (pi re-checks after every agent_end while tokens keep
+ * growing), and a cancelled compaction never commits, so nothing later in
+ * the handler is needed.
+ *
+ * The self-compact flag is consumed UNCONDITIONALLY as the first step —
+ * a policy-triggered proactive compaction arrives as reason:"manual" with
+ * the flag armed; consuming it documents that and keeps the veto (which
+ * only touches reason:"threshold") inert for it.
+ */
+export function applyWhenPolicyVeto(input: {
+	timing: CompactionOptimizerSettings["timing"];
+	sessionId: string;
+	/** `event.reason` from session_before_compact. */
+	reason: unknown;
+	tokensBefore: number;
+	provider: string | undefined;
+	contextWindow: number;
+	/** Wraps notifyOnce(ctx, …) — injected so tests capture toasts. */
+	notifyOnceFn: (key: string, message: string, kind?: "info" | "warning" | "error") => void;
+}): { cancel: true } | undefined {
+	const { timing, sessionId } = input;
+	const selfTriggered = phaseState.consumeSelfCompact(sessionId);
+	if (selfTriggered) return undefined;
+
+	const decision = decideDefer({
+		settings: timing,
+		reason: input.reason,
+		provider: input.provider,
+		contextWindow: input.contextWindow,
+		tokensBefore: input.tokensBefore,
+		phase: {
+			subagentInFlight: phaseState.subagentInFlight(sessionId),
+			turnsSinceTaskTypeChange: phaseState.turnsSinceTaskTypeChange(sessionId),
+			taskTypeChangedSinceCompaction:
+				phaseState.taskTypeChangedSinceCompaction(sessionId),
+			deferrals: phaseState.deferralCount(sessionId),
+		},
+	});
+	if (decision.defer) {
+		const n = phaseState.noteDeferral(sessionId);
+		// One toast per deferral episode; re-armed when a real compaction
+		// commits (session_compact handler).
+		input.notifyOnceFn(
+			`defer:${sessionId}:active`,
+			`compaction-optimizer: deferred threshold compaction — ${
+				decision.reason === "fanout-in-flight"
+					? "subagent fan-out in flight"
+					: "mid-phase"
+			} (deferral ${n} this episode; compacts by ${Math.round(timing.deferCeilingFraction * 100)}% of window regardless).`,
+			"info",
+		);
+		return { cancel: true };
+	}
+	if (timing.enabled && decision.reason === "ceiling-reached") {
+		input.notifyOnceFn(
+			`defer:${sessionId}:ceiling`,
+			"compaction-optimizer: deferral ceiling reached — compacting now regardless of phase state.",
+			"info",
+		);
+	}
+	return undefined;
+}
+
+/**
+ * Step 3 — mode dispatch / shrink ladder / path-taken notify, extracted from
+ * the session_before_compact handler (#783). Pure with respect to the event
+ * bus: every effect goes through the injected notify/notifyOnceFn/stashEvent
+ * callbacks, so the branch matrix (deterministic, hybrid fall-through,
+ * ladder-exhausted, fileops-missing, llm-only) unit-tests on plain objects.
+ * Returns pi's SessionBeforeCompactResult contract: `{ compaction }` to
+ * replace the summary, or undefined to fall through to pi's LLM summarizer.
+ */
+export function dispatchCompactionMode(input: {
+	settings: CompactionOptimizerSettings;
+	sessionId: string;
+	customInstructions: string | undefined;
+	fileOps: FileOperationsLike | undefined;
+	messagesToSummarize: unknown[];
+	turnPrefixMessages: unknown[];
+	isSplitTurn: boolean;
+	firstKeptEntryId: string;
+	tokensBefore: number;
+	previousSummary: string | undefined;
+	/** `ctx.model.contextWindow` slice; 0 when unknown (hybrid falls back). */
+	contextWindow: number;
+	notify: (message: string, kind: "info" | "warning" | "error") => void;
+	notifyOnceFn: (key: string, message: string, kind?: "info" | "warning" | "error") => void;
+	stashEvent: (p: Pick<PendingEvent, "path"> & Partial<PendingEvent>) => void;
+}): undefined | { compaction: unknown } {
+	const {
+		settings,
+		sessionId,
+		customInstructions,
+		fileOps,
+		messagesToSummarize,
+		tokensBefore,
+	} = input;
+	const mode: Mode = settings.mode;
+
+	let useDeterministic = false;
+	let customInstructionsDropped = false;
+	// Hoisted so the fall-through branch can read `.reason` / `.metrics`
+	// for the path-taken notify (#242). Populated only when mode=hybrid.
+	let hybridResult: ReturnType<typeof decideHybrid> | undefined;
+
+	if (mode === "deterministic") {
+		useDeterministic = true;
+		if (customInstructions && customInstructions.trim().length > 0) {
+			customInstructionsDropped = true;
+			input.notifyOnceFn(
+				`mode:${sessionId}:det-instructions`,
+				"compaction-optimizer: /compact <instructions> not honored in deterministic mode; switch to hybrid or llm-only-with-dump to use custom instructions.",
+				"warning",
+			);
+		}
+	} else if (mode === "hybrid") {
+		// Context-window-relative token gate (ADR-0107). `ctx.model` may be
+		// undefined (ExtensionContext.model is optional in pi's contract);
+		// decideHybrid falls back to the absolute maxTokens gate when the
+		// window is unknown or non-positive.
+		hybridResult = decideHybrid({
+			messages: messagesToSummarize as never,
+			tokensBefore,
+			customInstructions,
+			thresholds: settings.hybrid,
+			contextWindow: input.contextWindow,
+		});
+		useDeterministic = hybridResult.decision === "deterministic";
+	}
+	// mode === "llm-only-with-dump": always fall through.
+
+	if (
+		useDeterministic &&
+		fileOps &&
+		fileOps.read instanceof Set &&
+		fileOps.written instanceof Set &&
+		fileOps.edited instanceof Set
+	) {
+		try {
+			// generatedAt pinned once per compaction so every rung retry
+			// renders the identical timestamp (per-rung byte-determinism,
+			// ADR-0108).
+			const builderInput = {
+				messagesToSummarize: messagesToSummarize as never,
+				turnPrefixMessages: input.turnPrefixMessages as never,
+				isSplitTurn: input.isSplitTurn,
+				previousSummary: input.previousSummary,
+				previousSummaryMaxChars: settings.hybrid.previousSummaryMaxChars,
+				fileOps,
+				tokensBefore,
+				generatedAt: new Date().toISOString(),
+				customInstructionsDropped,
+			};
+			// Output-side shrink ladder (#254, ADR-0108): walk RUNG_ORDER
+			// until the rendered summary fits the budget (first fit wins).
+			const budget = settings.hybrid.maxOutputTokens;
+			let rung: Rung = "full";
+			let summary = buildAtRung(builderInput, rung);
+			for (const next of RUNG_ORDER.slice(1)) {
+				if (estimateSummaryTokens(summary) <= budget) break;
+				rung = next;
+				summary = buildAtRung(builderInput, rung);
+			}
+			const overBudget = estimateSummaryTokens(summary) > budget;
+			const notifyMeta = {
+				mode,
+				messageCount:
+					hybridResult?.metrics.messageCount ?? messagesToSummarize.length,
+				tokenEstimate: hybridResult?.metrics.tokenEstimate ?? tokensBefore,
+				tokensFromPi: tokensBefore > 0,
+			};
+			if (overBudget && mode !== "deterministic") {
+				// Even the stub exceeds the budget — hybrid tolerates an LLM
+				// call, so fall through. Path-taken notify (#242) fires here,
+				// AFTER the ladder outcome is final.
+				input.notify(
+					formatPathNotify({ path: "ladder-exhausted", ...notifyMeta }),
+					"info",
+				);
+				input.stashEvent({
+					path: "ladder-exhausted",
+					reason: "ladder-exhausted",
+					metrics: hybridResult?.metrics,
+				});
+				return undefined;
+			}
+			if (overBudget) {
+				// mode=deterministic is an air-gap guarantee (ADR-0019): no
+				// LLM fallback exists. Emit the stub anyway, loudly.
+				input.notify(
+					"compaction-optimizer: stub-rung summary still exceeds hybrid.maxOutputTokens in deterministic mode; emitting anyway — no LLM fallback available in this mode.",
+					"warning",
+				);
+			}
+			// Mirror pi's CompactionDetails shape so cumulative file-tracking
+			// across compactions keeps working, plus our extension marker.
+			// Invariant (ADR-0108): details is built from fileOps directly,
+			// never derived from the rendered markdown — rungs that drop the
+			// File Activity section do not affect it.
+			const readFiles = [...fileOps.read].sort();
+			const modifiedFiles = [
+				...new Set([...fileOps.written, ...fileOps.edited]),
+			].sort();
+			// Path-taken notify (#242): air-gapped deterministic branch,
+			// emitted only after the rung decision is final.
+			input.notify(
+				formatPathNotify({ path: "deterministic", rung, ...notifyMeta }),
+				"info",
+			);
+			input.stashEvent({
+				path: "deterministic",
+				rung,
+				summaryTokens: estimateSummaryTokens(summary),
+				reason: hybridResult?.reason,
+				metrics: hybridResult?.metrics,
+			});
+			return {
+				compaction: {
+					summary,
+					firstKeptEntryId: input.firstKeptEntryId,
+					tokensBefore,
+					details: {
+						readFiles,
+						modifiedFiles,
+						generatedBy: "compaction-optimizer",
+						mode,
+					},
+				},
+			};
+		} catch (err) {
+			input.notify(
+				`compaction-optimizer: deterministic build failed (${(err as Error).message}); falling through to LLM summarizer.`,
+				"warning",
+			);
+			input.stashEvent({ path: "fallthrough", reason: "deterministic-build-failed" });
+			return undefined;
+		}
+	}
+
+	// llm-only-with-dump or hybrid-fall-through: pi default compact() runs.
+	// If the operator explicitly chose deterministic and we still reached
+	// this branch, fileOps was missing or not Set-shaped (future pi shape
+	// drift). Surface that so the fall-through is not silent.
+	if (useDeterministic) {
+		input.notifyOnceFn(
+			`mode:${sessionId}:det-fileops-missing`,
+			"compaction-optimizer: deterministic mode requested but preparation.fileOps was missing or not Set-shaped; falling through to pi default LLM summarizer.",
+			"warning",
+		);
+		input.stashEvent({ path: "fallthrough", reason: "fileops-missing" });
+	}
+	// Path-taken notify (#242): hybrid fall-through or llm-only-with-dump.
+	// Skipped when useDeterministic was true but fileOps was missing — the
+	// warning above is the louder, more useful signal in that edge case.
+	if (!useDeterministic) {
+		if (mode === "hybrid" && hybridResult) {
+			input.notify(
+				formatPathNotify({
+					path: "fall-through",
+					mode,
+					messageCount: hybridResult.metrics.messageCount,
+					tokenEstimate: hybridResult.metrics.tokenEstimate,
+					tokensFromPi: tokensBefore > 0,
+					reason: hybridResult.reason,
+				}),
+				"info",
+			);
+			input.stashEvent({
+				path: "fallthrough",
+				reason: hybridResult.reason,
+				metrics: hybridResult.metrics,
+			});
+		} else if (mode === "llm-only-with-dump") {
+			input.notify(
+				formatPathNotify({
+					path: "llm-only",
+					mode,
+					messageCount: messagesToSummarize.length,
+					tokenEstimate: tokensBefore,
+					tokensFromPi: tokensBefore > 0,
+				}),
+				"info",
+			);
+			input.stashEvent({ path: "llm-only" });
+		}
+	}
+	return undefined;
+}
+
 export default async function (pi: Pi): Promise<void> {
 	// Best-effort startup sweep; never blocks load.
 	void sweepEphemerals();
@@ -196,61 +530,30 @@ export default async function (pi: Pi): Promise<void> {
 			}
 
 			const sessionId = sessionIdOf(ctx);
+			const modelInfo = modelInfoOf(ctx);
+			const notifyOnceFn = (
+				key: string,
+				message: string,
+				kind: "info" | "warning" | "error" = "info",
+			): void => notifyOnce(ctx, key, message, kind);
 
-			// 0. When-policy veto (#677, ADR-0109) — MUST precede the
-			//    file-tracker prune and snapshot capture: both are wasted work
-			//    on a deferred fire (pi re-checks after every agent_end while
-			//    tokens keep growing), and a cancelled compaction never
-			//    commits, so nothing below is needed. A policy-triggered
-			//    proactive compaction arrives as reason:"manual" with the
-			//    self-flag armed; consuming the flag documents it and keeps
-			//    the veto (which only touches reason:"threshold") inert.
-			const selfTriggered = phaseState.consumeSelfCompact(sessionId);
-			if (!selfTriggered) {
-				const modelInfo = modelInfoOf(ctx);
-				const decision = decideDefer({
-					settings: settings.timing,
-					reason: (event as { reason?: unknown })?.reason,
-					provider: modelInfo.provider,
-					contextWindow: modelInfo.contextWindow,
-					tokensBefore: Number(event?.preparation?.tokensBefore ?? 0),
-					phase: {
-						subagentInFlight: phaseState.subagentInFlight(sessionId),
-						turnsSinceTaskTypeChange:
-							phaseState.turnsSinceTaskTypeChange(sessionId),
-						taskTypeChangedSinceCompaction:
-							phaseState.taskTypeChangedSinceCompaction(sessionId),
-						deferrals: phaseState.deferralCount(sessionId),
-					},
-				});
-				if (decision.defer) {
-					const n = phaseState.noteDeferral(sessionId);
-					// One toast per deferral episode; re-armed when a real
-					// compaction commits (session_compact handler below).
-					notifyOnce(
-						ctx,
-						`defer:${sessionId}:active`,
-						`compaction-optimizer: deferred threshold compaction — ${
-							decision.reason === "fanout-in-flight"
-								? "subagent fan-out in flight"
-								: "mid-phase"
-						} (deferral ${n} this episode; compacts by ${Math.round(settings.timing.deferCeilingFraction * 100)}% of window regardless).`,
-						"info",
-					);
-					return { cancel: true };
-				}
-				if (
-					settings.timing.enabled &&
-					decision.reason === "ceiling-reached"
-				) {
-					notifyOnce(
-						ctx,
-						`defer:${sessionId}:ceiling`,
-						"compaction-optimizer: deferral ceiling reached — compacting now regardless of phase state.",
-						"info",
-					);
-				}
-			}
+			// 0. When-policy veto (#677, ADR-0109) — extracted (#783); see
+			//    applyWhenPolicyVeto for the ordering rationale.
+			const veto = applyWhenPolicyVeto({
+				timing: settings.timing,
+				sessionId,
+				reason: (event as { reason?: unknown })?.reason,
+				tokensBefore: Number(event?.preparation?.tokensBefore ?? 0),
+				provider: modelInfo.provider,
+				contextWindow: modelInfo.contextWindow,
+				notifyOnceFn,
+			});
+			if (veto) return veto;
+
+			// Metrics ledger (#838, ADR-0117): stamp dispatch start now — the
+			// committed record's latency spans from here through session_compact,
+			// so fall-through paths include pi's LLM summarizer run.
+			const eventT0 = performance.now();
 
 			// 1. File-tracker pruning — mutate fileOps in place. Default compact()
 			//    consumes the pruned sets via computeFileLists(). Deterministic mode
@@ -312,187 +615,48 @@ export default async function (pi: Pi): Promise<void> {
 				);
 			}
 
-			// 3. Mode dispatch.
-			const mode: Mode = settings.mode;
-			const customInstructions: string | undefined = event?.customInstructions;
+			// 3. Mode dispatch — extracted (#783) into dispatchCompactionMode.
 
-			let useDeterministic = false;
-			let customInstructionsDropped = false;
-			// Hoisted so the fall-through branch can read `.reason` / `.metrics`
-			// for the path-taken notify (#242). Populated only when mode=hybrid.
-			let hybridResult:
-				| ReturnType<typeof decideHybrid>
-				| undefined;
-
-			if (mode === "deterministic") {
-				useDeterministic = true;
-				if (customInstructions && customInstructions.trim().length > 0) {
-					customInstructionsDropped = true;
-					notifyOnce(
-						ctx,
-						`mode:${sessionId}:det-instructions`,
-						"compaction-optimizer: /compact <instructions> not honored in deterministic mode; switch to hybrid or llm-only-with-dump to use custom instructions.",
-						"warning",
-					);
-				}
-			} else if (mode === "hybrid") {
-				// Context-window-relative token gate (ADR-0107). `ctx.model` may be
-				// undefined (ExtensionContext.model is optional in pi's contract);
-				// decideHybrid falls back to the absolute maxTokens gate when the
-				// window is unknown or non-positive.
-				const { contextWindow } = modelInfoOf(ctx);
-				hybridResult = decideHybrid({
-					messages: messagesToSummarize as never,
+			// Metrics ledger (#838): each dispatch branch stashes its outcome;
+			// session_compact completes + appends it. One model-slice read,
+			// shared across branches.
+			const stashEvent = (
+				p: Pick<PendingEvent, "path"> & Partial<PendingEvent>,
+			): void => {
+				if (!settings.events.enabled) return;
+				PENDING_EVENTS.set(sessionId, {
+					sessionId,
+					mode: settings.mode,
 					tokensBefore,
-					customInstructions,
-					thresholds: settings.hybrid,
-					contextWindow,
+					model: modelInfo.id,
+					provider: modelInfo.provider,
+					rates: modelInfo.rates,
+					t0: eventT0,
+					...p,
 				});
-				useDeterministic = hybridResult.decision === "deterministic";
-			}
-			// mode === "llm-only-with-dump": always fall through.
+			};
 
-			if (
-				useDeterministic &&
-				fileOps &&
-				fileOps.read instanceof Set &&
-				fileOps.written instanceof Set &&
-				fileOps.edited instanceof Set
-			) {
-				try {
-					// generatedAt pinned once per compaction so every rung retry
-					// renders the identical timestamp (per-rung byte-determinism,
-					// ADR-0108).
-					const builderInput = {
-						messagesToSummarize: messagesToSummarize as never,
-						turnPrefixMessages: turnPrefixMessages as never,
-						isSplitTurn,
-						previousSummary,
-						previousSummaryMaxChars: settings.hybrid.previousSummaryMaxChars,
-						fileOps,
-						tokensBefore,
-						generatedAt: new Date().toISOString(),
-						customInstructionsDropped,
-					};
-					// Output-side shrink ladder (#254, ADR-0108): walk RUNG_ORDER
-					// until the rendered summary fits the budget (first fit wins).
-					const budget = settings.hybrid.maxOutputTokens;
-					let rung: Rung = "full";
-					let summary = buildAtRung(builderInput, rung);
-					for (const next of RUNG_ORDER.slice(1)) {
-						if (estimateSummaryTokens(summary) <= budget) break;
-						rung = next;
-						summary = buildAtRung(builderInput, rung);
-					}
-					const overBudget = estimateSummaryTokens(summary) > budget;
-					const notifyMeta = {
-						mode,
-						messageCount:
-							hybridResult?.metrics.messageCount ?? messagesToSummarize.length,
-						tokenEstimate: hybridResult?.metrics.tokenEstimate ?? tokensBefore,
-						tokensFromPi: tokensBefore > 0,
-					};
-					if (overBudget && mode !== "deterministic") {
-						// Even the stub exceeds the budget — hybrid tolerates an LLM
-						// call, so fall through. Path-taken notify (#242) fires here,
-						// AFTER the ladder outcome is final.
-						ctx?.ui?.notify?.(
-							formatPathNotify({ path: "ladder-exhausted", ...notifyMeta }),
-							"info",
-						);
-						return undefined;
-					}
-					if (overBudget) {
-						// mode=deterministic is an air-gap guarantee (ADR-0019): no
-						// LLM fallback exists. Emit the stub anyway, loudly.
-						ctx?.ui?.notify?.(
-							"compaction-optimizer: stub-rung summary still exceeds hybrid.maxOutputTokens in deterministic mode; emitting anyway — no LLM fallback available in this mode.",
-							"warning",
-						);
-					}
-					// Mirror pi's CompactionDetails shape so cumulative file-tracking
-					// across compactions keeps working, plus our extension marker.
-					// Invariant (ADR-0108): details is built from fileOps directly,
-					// never derived from the rendered markdown — rungs that drop the
-					// File Activity section do not affect it.
-					const readFiles = [...fileOps.read].sort();
-					const modifiedFiles = [
-						...new Set([...fileOps.written, ...fileOps.edited]),
-					].sort();
-					// Path-taken notify (#242): air-gapped deterministic branch,
-					// emitted only after the rung decision is final.
-					ctx?.ui?.notify?.(
-						formatPathNotify({ path: "deterministic", rung, ...notifyMeta }),
-						"info",
-					);
-					return {
-						compaction: {
-							summary,
-							firstKeptEntryId,
-							tokensBefore,
-							details: {
-								readFiles,
-								modifiedFiles,
-								generatedBy: "compaction-optimizer",
-								mode,
-							},
-						},
-					};
-				} catch (err) {
-					ctx?.ui?.notify?.(
-						`compaction-optimizer: deterministic build failed (${(err as Error).message}); falling through to LLM summarizer.`,
-						"warning",
-					);
-					return undefined;
-				}
-			}
+			return dispatchCompactionMode({
+				settings,
+				sessionId,
+				customInstructions: event?.customInstructions,
+				fileOps,
+				messagesToSummarize,
+				turnPrefixMessages,
+				isSplitTurn,
+				firstKeptEntryId,
+				tokensBefore,
+				previousSummary,
+				contextWindow: modelInfo.contextWindow,
+				notify: (m, k) => ctx?.ui?.notify?.(m, k),
+				notifyOnceFn,
+				stashEvent,
+			});
 
-			// llm-only-with-dump or hybrid-fall-through: pi default compact() runs.
-			// If the operator explicitly chose deterministic and we still reached
-			// this branch, fileOps was missing or not Set-shaped (future pi shape
-			// drift). Surface that so the fall-through is not silent.
-			if (useDeterministic) {
-				notifyOnce(
-					ctx,
-					`mode:${sessionId}:det-fileops-missing`,
-					"compaction-optimizer: deterministic mode requested but preparation.fileOps was missing or not Set-shaped; falling through to pi default LLM summarizer.",
-					"warning",
-				);
-			}
-			// Path-taken notify (#242): hybrid fall-through or llm-only-with-dump.
-			// Skipped when useDeterministic was true but fileOps was missing — the
-			// warning above is the louder, more useful signal in that edge case.
-			if (!useDeterministic) {
-				if (mode === "hybrid" && hybridResult) {
-					ctx?.ui?.notify?.(
-						formatPathNotify({
-							path: "fall-through",
-							mode,
-							messageCount: hybridResult.metrics.messageCount,
-							tokenEstimate: hybridResult.metrics.tokenEstimate,
-							tokensFromPi: tokensBefore > 0,
-							reason: hybridResult.reason,
-						}),
-						"info",
-					);
-				} else if (mode === "llm-only-with-dump") {
-					ctx?.ui?.notify?.(
-						formatPathNotify({
-							path: "llm-only",
-							mode,
-							messageCount: messagesToSummarize.length,
-							tokenEstimate: tokensBefore,
-							tokensFromPi: tokensBefore > 0,
-						}),
-						"info",
-					);
-				}
-			}
-			return undefined;
 		},
 	);
 
-	pi.on("session_compact", async (_event: Pi, ctx: Pi): Promise<void> => {
+	pi.on("session_compact", async (event: Pi, ctx: Pi): Promise<void> => {
 		const sessionId = sessionIdOf(ctx);
 		// When-policy bookkeeping (#677): a compaction committed — record it,
 		// reset the deferral counter, and re-arm the defer/ceiling toasts so a
@@ -500,6 +664,44 @@ export default async function (pi: Pi): Promise<void> {
 		phaseState.noteCompaction(sessionId);
 		MODE_NOTIFY_SENT.delete(`defer:${sessionId}:active`);
 		MODE_NOTIFY_SENT.delete(`defer:${sessionId}:ceiling`);
+
+		// Metrics ledger (#838, ADR-0117): complete + append the pending record
+		// for this committed compaction. Runs BEFORE the snapshot early-return —
+		// a failed snapshot capture must not lose the metrics row. Best-effort:
+		// a ledger failure never disturbs the archive path.
+		const pendingEvent = PENDING_EVENTS.get(sessionId);
+		PENDING_EVENTS.delete(sessionId);
+		if (pendingEvent) {
+			try {
+				// On fall-through/llm-only paths the summary pi committed is the
+				// only source for the output-token estimate (pi core discards the
+				// summarizer call's real usage — #840, hence costBasis "derived").
+				const committedSummary = (
+					event as { compactionEntry?: { summary?: unknown } }
+				)?.compactionEntry?.summary;
+				const committedSummaryTokens =
+					typeof committedSummary === "string" && committedSummary.length > 0
+						? estimateSummaryTokens(committedSummary)
+						: undefined;
+				await appendEvent(
+					buildEventRecord({
+						pending: pendingEvent,
+						committedSummaryTokens,
+						now: performance.now(),
+						ts: new Date().toISOString(),
+						policy: policyTag(),
+					}),
+				);
+			} catch (err) {
+				notifyOnce(
+					ctx,
+					`events:${sessionId}:append-failed`,
+					`compaction-optimizer: metrics ledger append failed (${(err as Error).message}); compaction unaffected.`,
+					"warning",
+				);
+			}
+		}
+
 		const snap = snapshot.take(sessionId);
 		if (!snap) return; // No captured payload (e.g., compaction was cancelled).
 
@@ -539,6 +741,7 @@ export default async function (pi: Pi): Promise<void> {
 		snapshot.clear(sessionId);
 		clearNotifyForSession(sessionId);
 		phaseState.clearSession(sessionId);
+		PENDING_EVENTS.delete(sessionId);
 		await cleanupEphemerals();
 	});
 

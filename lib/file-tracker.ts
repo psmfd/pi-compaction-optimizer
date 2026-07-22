@@ -48,10 +48,13 @@ function compilePattern(pattern: string): RegExp | undefined {
  *      iteration order is insertion order in JavaScript), keeping the most
  *      recent N. Recent entries are more likely to be relevant carry-forward.
  *
- * Note: `staleAfterCompactions` from settings is currently informational; the
- * default `compact()` path does not surface per-file "age in compactions" to
- * extensions, so applying it requires reading historical `CompactionEntry`
- * details. Deferred to PR2 or later; settings key reserved for forward-compat.
+ * Note: age-based pruning ("drop read files older than N compactions") is
+ * deliberately NOT implemented — the default `compact()` path does not
+ * surface per-file "age in compactions" to extensions, so it would require
+ * reading historical `CompactionEntry` details. The former
+ * `staleAfterCompactions` settings key that reserved this was removed as
+ * dead contract surface (#784); re-adding the feature starts with a real
+ * per-file age design, not a lever.
  */
 export function pruneReadSet(
 	fileOps: FileOperationsLike,

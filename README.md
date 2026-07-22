@@ -353,6 +353,35 @@ The edge-case `warning`-level notifies:
 - Snapshot capture failed → warning; **the archive for that checkpoint is skipped**.
 - Settings load failed in `session_compact` → warning; the already-consumed snapshot's archive is dropped (silent-data-loss relevant, especially in `llm-only-with-dump` mode where the archive is the primary record).
 
+## Metrics ledger (#838, ADR-0117)
+
+One JSONL record per **committed** compaction is appended to
+`~/.pi/agent/extensions/compaction-optimizer/events.jsonl` (extension-owned,
+append-only, gitignored — the cache-meter `turns.jsonl` placement).
+`session_before_compact` stashes the dispatch outcome (path, rung,
+fall-through reason, `tokensBefore`, active-model rates, a start stamp);
+`session_compact` completes and appends it — so cancelled/deferred compactions
+never log, and `latencyMs` spans the real pause including pi's LLM summarizer
+run on fall-through paths. Observational only: the emitter never influences
+dispatch, and an append failure degrades to a one-shot notify.
+
+Each record carries an explicit **cost basis**:
+
+| Basis      | Meaning |
+|------------|---------|
+| `zero`     | Deterministic builder — no model call. `counterfactualDefaultCostUSD` prices what pi's default summarizer *would* have cost (`tokensBefore` × input rate + this compaction's own summary size as the output proxy). |
+| `derived`  | pi's built-in summarizer ran on the active model. pi core discards the call's real usage before any hook fires (#840), so the cost is reconstructed from `tokensBefore` × input rate + the committed summary's estimated tokens × output rate — an **upper bound**, blind to the provider prefix-cache split. Components are logged for bounds reporting. |
+| `reported` | Reserved for a compaction-optimizer-initiated summarizer call with real provider usage (#839). |
+
+Report with [`scripts/compaction-metrics.sh`](https://github.com/psmfd/pi-config/blob/main/scripts/compaction-metrics.sh):
+the per-compaction table plus per-path rollups, `--by-policy` for a
+`TOKEN_METER_POLICY_TAG` × path A/B cross-tab (session-level spend comparison
+stays on `token-meter.sh --compare-policies`). Post-compaction cache effects
+(CHR recovery) are not in this ledger — join `events.jsonl` `ts` against
+cache-meter `turns.jsonl` by wall-clock proximity, valid only under a
+single-live-session assumption (the `run-cache-ratio.sh` runbook's existing
+constraint).
+
 ## Settings
 
 Settings are read from `~/.pi/agent/settings.json` (user) and
@@ -378,7 +407,6 @@ arbitrary-file-write primitive. See
 | `hybrid.maxOutputTokens`             | yes              | yes           | `8000` (output-side budget; shrink ladder, ADR-0108)     |
 | `hybrid.previousSummaryMaxChars`     | yes              | yes           | `500` (0 omits Carried-Forward; #253)                    |
 | `fileTracker.maxReadFiles`           | yes              | yes           | `50`                                                     |
-| `fileTracker.staleAfterCompactions`  | yes              | yes (reserved) | `3` (informational)                                     |
 | `fileTracker.dropPatterns`           | yes              | **rejected**  | `[]`                                                     |
 | `timing.enabled`                     | yes              | **rejected**  | `false` (when-policy, ADR-0109)                          |
 | `timing.providers`                   | yes              | **rejected**  | `["omlx"]`                                               |
@@ -390,6 +418,7 @@ arbitrary-file-write primitive. See
 | `archive.path`                       | yes (abs or `~`) | **rejected**  | `~/.pi/agent/extensions/compaction-optimizer/archive`    |
 | `archive.ephemeralBehavior`          | yes              | **rejected**  | `skip`                                                   |
 | `archive.redactPatterns`             | yes              | **rejected**  | `[]`                                                     |
+| `events.enabled`                     | yes              | yes           | `true` (metrics ledger, #838/ADR-0117)                   |
 
 Project-layer values for the rejected keys are dropped with a single
 `ctx.ui.notify` warning naming the rejected key. A follow-up
@@ -411,7 +440,6 @@ merging (warning notify on each clamp):
 | `hybrid.maxOutputTokens`             | `2000` | `100000` |
 | `hybrid.previousSummaryMaxChars`     | `0`   | `100000`  |
 | `fileTracker.maxReadFiles`           | `1`   | `1000`    |
-| `fileTracker.staleAfterCompactions`  | `1`   | `100`     |
 
 The clamps cannot be loosened by the project layer (they live in the
 user-trust-boundary loader). They are not exfiltration primitives —
