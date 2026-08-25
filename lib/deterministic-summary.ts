@@ -17,7 +17,7 @@
  * - ADR-0019 §Decision Outcome (mode taxonomy, `details` shape)
  * - ADR-0019 §Design Discussion (markdown schema)
  * - rules/structured-review-format.md (subagent verdict extraction)
- * - rules/subagent-parallel-handoff.md (Form A REPORT_FILE: extraction)
+ * - rules/subagent-sequence-handoff.md (Form A REPORT_FILE: extraction)
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -224,7 +224,7 @@ export function estimateTokens(msg: AgentMessage): number {
  * `Verdict: PASS`) — absorbs minor drift from `rules/structured-review-format.md`
  * canonical form. PR2 plan Q2 explicitly chose permissive over strict. The
  * `g` + `i` + `m` flags drive `matchAll` so we surface every verdict in a
- * single aggregated parallel-subagent toolResult (not just the first).
+ * single aggregated serial-sequence toolResult (not just the first).
  *
  * Backtracking safety: the input is unbounded subagent-transcript text, so the
  * separator structure must stay unambiguous — each optional separator group
@@ -236,16 +236,11 @@ export function estimateTokens(msg: AgentMessage): number {
 const VERDICT_RE = /^[ \t]*\*{0,2}Verdict\*{0,2}(?:[ \t]*:)?(?:[ \t]*\*{1,2})?[ \t]*(PASS|PASS_WITH_WARNINGS|NEEDS_CHANGES|PRECONDITION_FAILURE)\b/gim;
 const REPORT_FILE_RE = /^\s*REPORT_FILE:\s*(\S+)/gim;
 const AGENT_ARG_KEYS = ["agent", "agentName", "name"] as const;
-// Per-task header emitted by the vendored subagent extension in parallel
-// mode — see agent/extensions/subagent/index.ts (the `### [<agent>] <status>`
-// emitter around the `summaries.map(...)` block). Status word is optional
-// because some fixtures (and a possible future emitter change) omit it.
-const PARALLEL_HEADER_RE = /^###\s+\[([^\]\n]+)\](?:\s+\S+)?\s*$/gm;
-// Form B sentinel — see rules/subagent-parallel-handoff.md. The verdict line
-// is contractually emitted AFTER the report block, so we scope verdict scans
-// to text after the last `<!-- END REPORT -->` within a segment when one is
-// present. This defeats `Verdict:` lines quoted inside a nested report.
+// Per-item header emitted by the vendored subagent extension in sequence mode.
+const SEQUENCE_HEADER_RE = /^###\s+\[([^\]\n]+)\](?:\s+\S+)?\s*$/gm;
+// Legacy HTML sentinel plus the active fenced Form B contract.
 const REPORT_END_MARKER = "<!-- END REPORT -->";
+const REPORT_FENCE_OPEN = "```report";
 
 interface SubagentVerdict {
 	agent: string;
@@ -254,20 +249,15 @@ interface SubagentVerdict {
 	briefExcerpt: string;
 }
 
-/**
- * Index a subagent toolCall's argument structure by call id, returning the
- * list of agent names invoked (`[agent]` for single mode, `[a, b, c]` for
- * parallel-tasks mode). Used by `extractSubagentVerdicts` to pair Nth
- * verdict with Nth task agent in parallel reports.
- */
+/** Index the ordered agent names for single or serial sequence calls. */
 function agentsFromToolCallArgs(args: Record<string, unknown>): string[] {
 	for (const k of AGENT_ARG_KEYS) {
 		const v = args[k];
 		if (typeof v === "string" && v.length > 0) return [v];
 	}
-	if (Array.isArray(args.tasks)) {
-		return (args.tasks as Array<Record<string, unknown>>)
-			.map((t) => (typeof t.agent === "string" ? t.agent : "<unknown>"));
+	if (Array.isArray(args.sequence)) {
+		return (args.sequence as Array<Record<string, unknown>>)
+			.map((item) => (typeof item.agent === "string" ? item.agent : "<unknown>"));
 	}
 	return ["<unknown>"];
 }
@@ -300,14 +290,9 @@ function extractSubagentVerdicts(messages: AgentMessage[]): SubagentVerdict[] {
 			SUBAGENT_BRIEF_EXCERPT_MAX_CHARS,
 		);
 
-		// Preferred path: split the toolResult into per-task segments using the
-		// `### [<agent>] <status>` headers the subagent extension emits in
-		// parallel mode. This (a) attributes each verdict to the agent named in
-		// the header rather than relying on the Nth call-arg matching the Nth
-		// Verdict match (the original positional-pairing bug, #229), and (b)
-		// scopes the verdict regex to one segment at a time so a quoted
-		// `Verdict:` line in one segment cannot mis-attribute to another agent.
-		const segments = splitParallelSegments(text);
+		// Preferred path: split the toolResult into per-item sequence segments.
+		// Header attribution avoids positional-pairing and quoted-verdict bugs.
+		const segments = splitSequenceSegments(text);
 		if (segments.length > 0) {
 			for (const seg of segments) {
 				const row = extractVerdictFromScope(seg.body);
@@ -346,26 +331,21 @@ function extractSubagentVerdicts(messages: AgentMessage[]): SubagentVerdict[] {
 	return out;
 }
 
-interface ParallelSegment {
+interface SequenceSegment {
 	agent: string;
 	body: string;
 }
 
-/**
- * Slice the toolResult text on `### [<agent>] <status>` headers, returning
- * one segment per header. Returns `[]` when no headers are present (caller
- * falls back to the global-scan path).
- */
-function splitParallelSegments(text: string): ParallelSegment[] {
-	// Reset the regex state — it's `g`-flagged at module scope.
-	PARALLEL_HEADER_RE.lastIndex = 0;
+/** Slice aggregated sequence text on `### [<agent>] <status>` headers. */
+function splitSequenceSegments(text: string): SequenceSegment[] {
+	SEQUENCE_HEADER_RE.lastIndex = 0;
 	const headers: { agent: string; start: number; end: number }[] = [];
 	let match: RegExpExecArray | null;
-	while ((match = PARALLEL_HEADER_RE.exec(text)) !== null) {
+	while ((match = SEQUENCE_HEADER_RE.exec(text)) !== null) {
 		headers.push({ agent: match[1].trim(), start: match.index, end: match.index + match[0].length });
 	}
 	if (headers.length === 0) return [];
-	const segments: ParallelSegment[] = [];
+	const segments: SequenceSegment[] = [];
 	for (let i = 0; i < headers.length; i++) {
 		const bodyStart = headers[i].end;
 		const bodyEnd = i + 1 < headers.length ? headers[i + 1].start : text.length;
@@ -374,22 +354,30 @@ function splitParallelSegments(text: string): ParallelSegment[] {
 	return segments;
 }
 
-/**
- * Scoped verdict extraction for one per-task segment.
- *
- * Per `rules/subagent-parallel-handoff.md`, the VERDICT line is emitted
- * AFTER the report block (Form B: after `<!-- END REPORT -->`; Form A:
- * after the `REPORT_FILE:` line). So when a segment contains
- * `<!-- END REPORT -->`, we scope the verdict scan to text after the LAST
- * occurrence — nested quoted reports cannot mis-attribute. Within the
- * scope, the LAST matched VERDICT wins (the agent's own verdict line is
- * the terminal one per the contract).
- */
+/** Return the final boundary of a legacy HTML or fenced Form B report. */
+function finalReportBoundary(body: string): number {
+	let boundary = -1;
+	const legacy = body.lastIndexOf(REPORT_END_MARKER);
+	if (legacy >= 0) boundary = legacy + REPORT_END_MARKER.length;
+
+	let cursor = 0;
+	while (cursor < body.length) {
+		const open = body.indexOf(REPORT_FENCE_OPEN, cursor);
+		if (open < 0) break;
+		const close = body.indexOf("```", open + REPORT_FENCE_OPEN.length);
+		if (close < 0) break;
+		boundary = Math.max(boundary, close + 3);
+		cursor = close + 3;
+	}
+	return boundary;
+}
+
+/** Extract the terminal verdict outside any embedded Form B report. */
 function extractVerdictFromScope(
 	body: string,
 ): { verdict: string; reportFile?: string } | undefined {
-	const lastEnd = body.lastIndexOf(REPORT_END_MARKER);
-	const scope = lastEnd >= 0 ? body.slice(lastEnd + REPORT_END_MARKER.length) : body;
+	const boundary = finalReportBoundary(body);
+	const scope = boundary >= 0 ? body.slice(boundary) : body;
 	const verdictMatches = [...scope.matchAll(VERDICT_RE)];
 	if (verdictMatches.length === 0) return undefined;
 	const reportMatches = [...scope.matchAll(REPORT_FILE_RE)];

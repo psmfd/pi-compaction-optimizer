@@ -1,6 +1,6 @@
 {
   "name": "@psmfd/pi-compaction-optimizer",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Pi extension: deterministic/hybrid context-compaction summaries with a local archive of pre-compaction snapshots",
   "type": "module",
   "license": "MIT",

@@ -178,7 +178,7 @@ test("buildDeterministicSummary: subagent verdict extraction (permissive)", () =
 				"tc-1",
 				"some prelude\n\n**Verdict:** PASS_WITH_WARNINGS\n\nmore text",
 			),
-			assistantToolCall("subagent", { tasks: [{ agent: "linter", task: "x" }] }, "tc-2"),
+			assistantToolCall("subagent", { sequence: [{ agent: "linter", task: "x" }] }, "tc-2"),
 			toolResult(
 				"subagent",
 				"tc-2",
@@ -352,14 +352,14 @@ test("toolCallCount: sums toolCall blocks across assistant messages", () => {
 	);
 });
 
-test("buildDeterministicSummary: parallel fan-out emits one verdict row per task", () => {
+test("buildDeterministicSummary: serial sequence emits one verdict row per item", () => {
 	const out = buildDeterministicSummary({
 		messagesToSummarize: [
 			userMsg("/review"),
 			assistantToolCall(
 				"subagent",
 				{
-					tasks: [
+					sequence: [
 						{ agent: "code-review-expert", task: "x" },
 						{ agent: "security-review-expert", task: "y" },
 						{ agent: "linter", task: "z" },
@@ -443,14 +443,14 @@ test("buildDeterministicSummary: empty input degrades gracefully", () => {
 // at agents.length.
 // ---------------------------------------------------------------------------
 
-test("verdict extraction #229: real subagent format (`Parallel: N/M succeeded` preamble + `\\n---\\n` separators)", () => {
+test("verdict extraction #229: real serial sequence preamble and separators", () => {
 	const out = buildDeterministicSummary({
 		messagesToSummarize: [
 			userMsg("/review"),
 			assistantToolCall(
 				"subagent",
 				{
-					tasks: [
+					sequence: [
 						{ agent: "code-review-expert", task: "x" },
 						{ agent: "security-review-expert", task: "y" },
 						{ agent: "linter", task: "z" },
@@ -462,7 +462,7 @@ test("verdict extraction #229: real subagent format (`Parallel: N/M succeeded` p
 				"subagent",
 				"tc-real",
 				[
-					"Parallel: 3/3 succeeded",
+					"Sequence: 3/3 succeeded",
 					"",
 					"### [code-review-expert] completed",
 					"",
@@ -515,7 +515,7 @@ test("verdict extraction #229: quoted inner `Verdict:` in one segment does not m
 			assistantToolCall(
 				"subagent",
 				{
-					tasks: [
+					sequence: [
 						{ agent: "code-review-expert", task: "x" },
 						{ agent: "security-review-expert", task: "y" },
 					],
@@ -558,26 +558,23 @@ test("verdict extraction #229: quoted inner `Verdict:` in one segment does not m
 	assert.match(out, /code-review-expert.*PASS\b/);
 });
 
-test("verdict extraction #229: Form B `<!-- END REPORT -->` shields nested verdicts inside the block", () => {
-	// The inner report block quotes a chain of prior verdicts. The agent's
-	// OWN verdict line is contractually after `<!-- END REPORT -->`. The
-	// scope-after-last-END-REPORT rule must apply.
+test("verdict extraction #229: fenced Form B shields nested verdicts inside the report", () => {
 	const out = buildDeterministicSummary({
 		messagesToSummarize: [
 			userMsg("/review"),
-			assistantToolCall("subagent", { tasks: [{ agent: "code-review-expert", task: "x" }] }, "tc-formB"),
+			assistantToolCall("subagent", { sequence: [{ agent: "code-review-expert", task: "x" }] }, "tc-formB"),
 			toolResult(
 				"subagent",
 				"tc-formB",
 				[
 					"### [code-review-expert] completed",
 					"",
-					"<!-- BEGIN REPORT -->",
+					"```report",
 					"Prior cycle artifacts:",
 					"Verdict: NEEDS_CHANGES",
 					"Verdict: PRECONDITION_FAILURE",
 					"Verdict: PASS_WITH_WARNINGS",
-					"<!-- END REPORT -->",
+					"```",
 					"",
 					"Summary: all clean.",
 					"VERDICT: PASS",
@@ -591,17 +588,10 @@ test("verdict extraction #229: Form B `<!-- END REPORT -->` shields nested verdi
 		generatedAt: "2026-01-01T00:00:00.000Z",
 		customInstructionsDropped: false,
 	});
-	// Inspect the verdict-column value for the single row — the brief column
-	// naturally echoes the raw text (incl. inner-block verdicts), so we can't
-	// assert globally on the verdict tokens. The fix's contract is that the
-	// Verdict CELL is `PASS`, not one of the shielded inner verdicts.
-	const row = out.split("\n").find((l) => /code-review-expert/.test(l) && /\|/.test(l));
+	const row = out.split("\n").find((line) => /code-review-expert/.test(line) && /\|/.test(line));
 	assert.ok(row, `expected a verdict row for code-review-expert; got:\n${out}`);
-	const cells = row.split("|").map((c) => c.trim());
-	// Row shape: `| `agent` | VERDICT | brief |` → split yields 5 entries
-	// (leading & trailing empties + 3 cells).
-	const verdictCell = cells[2];
-	assert.equal(verdictCell, "PASS", `verdict cell must be the post-END-REPORT VERDICT ("PASS"); got "${verdictCell}" from row: ${row}`);
+	const cells = row.split("|").map((cell) => cell.trim());
+	assert.equal(cells[2], "PASS", `verdict cell must use the post-fence verdict; row: ${row}`);
 });
 
 test("verdict extraction #229: single-mode toolResult (no headers) still works via fallback", () => {
@@ -636,7 +626,7 @@ test("verdict extraction #229: fallback caps row count to agents.length (fail-cl
 			userMsg("/review"),
 			assistantToolCall(
 				"subagent",
-				{ tasks: [{ agent: "agent-a", task: "x" }, { agent: "agent-b", task: "y" }] },
+				{ sequence: [{ agent: "agent-a", task: "x" }, { agent: "agent-b", task: "y" }] },
 				"tc-noheader",
 			),
 			toolResult(
