@@ -353,7 +353,7 @@ The edge-case `warning`-level notifies:
 - Snapshot capture failed → warning; **the archive for that checkpoint is skipped**.
 - Settings load failed in `session_compact` → warning; the already-consumed snapshot's archive is dropped (silent-data-loss relevant, especially in `llm-only-with-dump` mode where the archive is the primary record).
 
-## Metrics ledger (#838, ADR-0117)
+## Metrics ledger (#838, ADR-0151)
 
 One JSONL record per **committed** compaction is appended to
 `~/.pi/agent/extensions/compaction-optimizer/events.jsonl` (extension-owned,
@@ -365,20 +365,33 @@ never log, and `latencyMs` spans the real pause including pi's LLM summarizer
 run on fall-through paths. Observational only: the emitter never influences
 dispatch, and an append failure degrades to a one-shot notify.
 
-Each record carries an explicit **cost basis**:
+Each record carries an explicit **cost basis**. ADR-0151 supersedes
+ADR-0117's original derived-first precedence after #840 landed in pi:
 
 | Basis      | Meaning |
 |------------|---------|
 | `zero`     | Deterministic builder — no model call. `counterfactualDefaultCostUSD` prices what pi's default summarizer *would* have cost (`tokensBefore` × input rate + this compaction's own summary size as the output proxy). |
-| `derived`  | pi's built-in summarizer ran on the active model. pi core discards the call's real usage before any hook fires (#840), so the cost is reconstructed from `tokensBefore` × input rate + the committed summary's estimated tokens × output rate — an **upper bound**, blind to the provider prefix-cache split. Components are logged for bounds reporting. |
-| `reported` | Reserved for a compaction-optimizer-initiated summarizer call with real provider usage (#839). |
+| `reported` | The committed `CompactionEntry.usage` supplied provider token/cache counts and a finite pi-calculated total. This is the normal built-in summarizer path in pinned pi `v0.84.2-psmfd.1`; a future #839 custom summarizer can use the same basis by returning its usage. |
+| `derived`  | Backward-compatible fallback when committed usage is absent or lacks a finite total. Cost is reconstructed from `tokensBefore` × input rate + the committed summary's estimated tokens × output rate. It is an upper bound, not provider-reported usage. |
+
+`reported` records include a `usage` object with input, output, cache-read,
+cache-write, total-token, and optional provider-specific components. Their
+dollar value uses pi's registered model rates; it is not a billing-statement
+reconciliation. Historical `derived` rows remain unchanged and can coexist
+with all three bases in the append-only ledger.
 
 Report with [`scripts/compaction-metrics.sh`](https://github.com/psmfd/pi-config/blob/main/scripts/compaction-metrics.sh):
-the per-compaction table plus per-path rollups, `--by-policy` for a
-`TOKEN_METER_POLICY_TAG` × path A/B cross-tab (session-level spend comparison
-stays on `token-meter.sh --compare-policies`). Post-compaction cache effects
-(CHR recovery) are not in this ledger — join `events.jsonl` `ts` against
-cache-meter `turns.jsonl` by wall-clock proximity, valid only under a
+the per-compaction table plus per-path rollups, or `--by-policy` for a
+`TOKEN_METER_POLICY_TAG` × path A/B cross-tab. Every rollup partitions
+provider-reported `spent` from the `derived-upper-bound`; only valid zero-basis
+counterfactuals contribute to `default-would-cost`. Missing/invalid costs,
+unknown bases, inconsistent counterfactuals, malformed records, and a partial
+trailing append surface as anomaly counters; affected totals are marked
+`totals-incomplete`. Control characters are neutralized, and reports refuse a
+ledger above 64 MiB rather than materializing it in `jq`. Session-level spend
+comparison stays on `token-meter.sh --compare-policies`. Post-compaction cache
+effects (CHR recovery) are not in this ledger — join `events.jsonl` `ts`
+against cache-meter `turns.jsonl` by wall-clock proximity, valid only under a
 single-live-session assumption (the `run-cache-ratio.sh` runbook's existing
 constraint).
 
@@ -418,7 +431,7 @@ arbitrary-file-write primitive. See
 | `archive.path`                       | yes (abs or `~`) | **rejected**  | `~/.pi/agent/extensions/compaction-optimizer/archive`    |
 | `archive.ephemeralBehavior`          | yes              | **rejected**  | `skip`                                                   |
 | `archive.redactPatterns`             | yes              | **rejected**  | `[]`                                                     |
-| `events.enabled`                     | yes              | yes           | `true` (metrics ledger, #838/ADR-0117)                   |
+| `events.enabled`                     | yes              | yes           | `true` (metrics ledger, #838/ADR-0151)                   |
 
 Project-layer values for the rejected keys are dropped with a single
 `ctx.ui.notify` warning naming the rejected key. A follow-up

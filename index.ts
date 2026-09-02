@@ -65,10 +65,20 @@ import * as phaseState from "./shared/phase-state.ts";
 // biome-ignore lint/suspicious/noExplicitAny: extension API surface
 type Pi = any;
 
+/** Read one untrusted runtime-event property without letting accessors abort metrics. */
+function readEventProperty(value: unknown, property: string): unknown {
+	try {
+		if (typeof value !== "object" || value === null) return undefined;
+		return (value as Record<string, unknown>)[property];
+	} catch {
+		return undefined;
+	}
+}
+
 const MODE_NOTIFY_SENT = new Set<string>();
 
 /**
- * Metrics ledger hand-off (#838, ADR-0117): `session_before_compact` stashes
+ * Metrics ledger hand-off (#838, ADR-0151): `session_before_compact` stashes
  * the dispatch outcome here; `session_compact` completes and appends it. Keyed
  * by session id, same lifecycle as the snapshot map — a cancelled compaction
  * never commits, so its pending entry is simply overwritten by the next fire
@@ -676,12 +686,12 @@ export default async function (pi: Pi): Promise<void> {
 		PENDING_EVENTS.delete(sessionId);
 		if (pendingEvent) {
 			try {
-				// On fall-through/llm-only paths the summary pi committed is the
-				// only source for the output-token estimate (pi core discards the
-				// summarizer call's real usage — #840, hence costBasis "derived").
-				const committedSummary = (
-					event as { compactionEntry?: { summary?: unknown } }
-				)?.compactionEntry?.summary;
+				// Pinned pi persists the built-in summarizer's Usage on the committed
+				// entry (#840). Prefer that usage-based cost; estimate the summary only
+				// for the backward-compatible derived fallback when usage is absent.
+				const committedEntry = readEventProperty(event, "compactionEntry");
+				const committedSummary = readEventProperty(committedEntry, "summary");
+				const committedUsage = readEventProperty(committedEntry, "usage");
 				const committedSummaryTokens =
 					typeof committedSummary === "string" && committedSummary.length > 0
 						? estimateSummaryTokens(committedSummary)
@@ -690,6 +700,7 @@ export default async function (pi: Pi): Promise<void> {
 					buildEventRecord({
 						pending: pendingEvent,
 						committedSummaryTokens,
+						committedUsage,
 						now: performance.now(),
 						ts: new Date().toISOString(),
 						policy: policyTag(),

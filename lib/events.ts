@@ -10,15 +10,14 @@
  * and `latencyMs` spans the real compaction pause including pi's LLM
  * summarizer run on fall-through paths.
  *
- * Cost bases (ADR-0117):
+ * Cost bases (ADR-0151; supersedes ADR-0117):
  *   - "zero"     — deterministic builder: no model call.
- *   - "derived"  — pi's built-in summarizer ran on the active model. pi core
- *     discards the call's real usage before any hook fires (#840), so the cost
- *     is reconstructed: tokensBefore × input rate + estimated summary tokens ×
- *     output rate. UPPER BOUND — blind to the provider prefix-cache split.
- *     Components are logged so reports can show bounds.
- *   - "reported" — reserved for a compaction-optimizer-initiated summarizer
- *     call that sees the provider's actual usage (#839).
+ *   - "reported" — the committed CompactionEntry carries provider-reported
+ *     usage and pi's usage-based cost. This is the normal built-in summarizer
+ *     path in pinned pi v0.84.2-psmfd.1 (#840).
+ *   - "derived"  — backward-compatible fallback when committed usage is absent
+ *     or lacks a finite total cost. Reconstructed from tokensBefore and the
+ *     estimated summary size; an upper bound, not provider-reported usage.
  *
  * Field vocabulary follows token-meter/cache-meter (ts/model/provider/policy)
  * for cross-ledger joins. The TOKEN_METER_POLICY_TAG read below is a
@@ -30,6 +29,7 @@
 import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import type { Usage } from "@earendil-works/pi-ai";
 
 const NAMESPACE = "compaction-optimizer";
 const LOG_BASENAME = "events.jsonl";
@@ -106,6 +106,8 @@ export interface CompactionEventRecord {
 		inputPerMTok?: number;
 		outputPerMTok?: number;
 	};
+	/** Provider-reported token/cache components; present for reported rows. */
+	usage?: Omit<Usage, "cost">;
 	metrics?: PendingEvent["metrics"];
 }
 
@@ -140,6 +142,98 @@ function round6(n: number): number {
 	return Math.round(n * 1e6) / 1e6;
 }
 
+interface NormalizedCommittedUsage {
+	usage: Omit<Usage, "cost">;
+	costTotal: number;
+}
+
+function isTokenCount(value: unknown): value is number {
+	return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
+function isCost(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+/** Accept only finite, non-negative, safely serializable runtime usage. */
+function normalizeCommittedUsage(value: unknown): NormalizedCommittedUsage | undefined {
+	try {
+		if (typeof value !== "object" || value === null) return undefined;
+		const raw = value as {
+			input?: unknown;
+			output?: unknown;
+			cacheRead?: unknown;
+			cacheWrite?: unknown;
+			cacheWrite1h?: unknown;
+			reasoning?: unknown;
+			totalTokens?: unknown;
+			cost?:
+				| {
+						input?: unknown;
+						output?: unknown;
+						cacheRead?: unknown;
+						cacheWrite?: unknown;
+						total?: unknown;
+				  }
+				| null;
+		};
+		// Snapshot each accessor exactly once. A stateful getter or proxy must not
+		// change a field between validation and construction of the ledger record.
+		const input = raw.input;
+		const output = raw.output;
+		const cacheRead = raw.cacheRead;
+		const cacheWrite = raw.cacheWrite;
+		const cacheWrite1h = raw.cacheWrite1h;
+		const reasoning = raw.reasoning;
+		const totalTokens = raw.totalTokens;
+		const cost = raw.cost;
+		if (
+			!isTokenCount(input) ||
+			!isTokenCount(output) ||
+			!isTokenCount(cacheRead) ||
+			!isTokenCount(cacheWrite) ||
+			!isTokenCount(totalTokens) ||
+			(cacheWrite1h !== undefined && !isTokenCount(cacheWrite1h)) ||
+			(reasoning !== undefined && !isTokenCount(reasoning))
+		) {
+			return undefined;
+		}
+		if (typeof cost !== "object" || cost === null) return undefined;
+		const costInput = cost.input;
+		const costOutput = cost.output;
+		const costCacheRead = cost.cacheRead;
+		const costCacheWrite = cost.cacheWrite;
+		const costTotalRaw = cost.total;
+		if (
+			!isCost(costInput) ||
+			!isCost(costOutput) ||
+			!isCost(costCacheRead) ||
+			!isCost(costCacheWrite) ||
+			!isCost(costTotalRaw)
+		) {
+			return undefined;
+		}
+		const costTotal = round6(costTotalRaw);
+		if (!Number.isFinite(costTotal)) return undefined;
+		return {
+			usage: {
+				input,
+				output,
+				cacheRead,
+				cacheWrite,
+				...(cacheWrite1h !== undefined ? { cacheWrite1h } : {}),
+				...(reasoning !== undefined ? { reasoning } : {}),
+				totalTokens,
+			},
+			costTotal,
+		};
+	} catch {
+		// Type assertions do not validate runtime event data. Any accessor or
+		// proxy failure degrades to derived accounting instead of dropping the row.
+		return undefined;
+	}
+}
+
 /**
  * Complete a pending record into the final ledger line. Pure — clock and
  * summary size are inputs, not reads — so tests pin the math exactly.
@@ -147,10 +241,14 @@ function round6(n: number): number {
  * `committedSummaryTokens` is the chars/4 estimate of the summary pi actually
  * committed (from `CompactionEntry.summary`); for the deterministic path the
  * pending record's own `summaryTokens` (identical text) takes precedence.
+ * `committedUsage` is untrusted runtime data from `CompactionEntry.usage`. A
+ * complete, finite, non-negative usage object takes precedence over derived
+ * reconstruction on every non-deterministic path.
  */
 export function buildEventRecord(opts: {
 	pending: PendingEvent;
 	committedSummaryTokens?: number;
+	committedUsage?: unknown;
 	now: number;
 	ts: string;
 	policy: string;
@@ -158,6 +256,10 @@ export function buildEventRecord(opts: {
 	const { pending, ts, policy } = opts;
 	const summaryTokens = pending.summaryTokens ?? opts.committedSummaryTokens;
 	const latencyMs = Math.max(0, Math.round(opts.now - pending.t0));
+	const normalizedUsage =
+		pending.path === "deterministic"
+			? undefined
+			: normalizeCommittedUsage(opts.committedUsage);
 
 	const record: CompactionEventRecord = {
 		ts,
@@ -167,7 +269,12 @@ export function buildEventRecord(opts: {
 		path: pending.path,
 		tokensBefore: pending.tokensBefore,
 		latencyMs,
-		costBasis: pending.path === "deterministic" ? "zero" : "derived",
+		costBasis:
+			pending.path === "deterministic"
+				? "zero"
+				: normalizedUsage !== undefined
+					? "reported"
+					: "derived",
 	};
 	if (pending.reason !== undefined) record.reason = pending.reason;
 	if (pending.rung !== undefined) record.rung = pending.rung;
@@ -175,6 +282,12 @@ export function buildEventRecord(opts: {
 	if (pending.model !== undefined) record.model = pending.model;
 	if (pending.provider !== undefined) record.provider = pending.provider;
 	if (pending.metrics !== undefined) record.metrics = pending.metrics;
+
+	if (normalizedUsage !== undefined) {
+		record.costUSD = normalizedUsage.costTotal;
+		record.usage = normalizedUsage.usage;
+		return record;
+	}
 
 	const rates = pending.rates;
 	if (rates && (rates.inputPerMTok > 0 || rates.outputPerMTok > 0)) {
@@ -192,9 +305,8 @@ export function buildEventRecord(opts: {
 			record.costUSD = 0;
 			record.counterfactualDefaultCostUSD = defaultPathUsd;
 		} else {
-			// pi's built-in summarizer ran on the active model: the derived figure
-			// IS the (upper-bound) actual. No separate counterfactual — this is
-			// the default.
+			// No finite committed usage cost was available. Preserve ADR-0117's
+			// reconstruction as an explicit backward-compatible fallback.
 			record.costUSD = defaultPathUsd;
 		}
 	} else if (pending.path === "deterministic") {

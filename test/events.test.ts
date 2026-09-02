@@ -1,7 +1,7 @@
 /**
- * Tests for the per-compaction metrics ledger (#838, ADR-0117).
+ * Tests for the per-compaction metrics ledger (#838, ADR-0151).
  *
- * Unit level: buildEventRecord cost math (zero/derived bases, counterfactual),
+ * Unit level: buildEventRecord cost math (zero/reported/derived bases, counterfactual),
  * policy-tag normalization, appendEvent JSONL round-trip against an injected
  * agentDir. Integration level: the index.ts hand-off — session_before_compact
  * stashes, session_compact appends — exercised through the extension factory
@@ -98,6 +98,93 @@ test("events: fallthrough record — derived cost from committed summary, no cou
 	assert.equal(rec.reason, "tool-call-ratio-low");
 	assert.equal(rec.summaryTokens, 2_000);
 	assert.equal(rec.latencyMs, 60_000);
+});
+
+test("events: committed usage takes precedence over derived cost", () => {
+	const rec = buildEventRecord({
+		pending: pending({ reason: "too-many-tokens" }),
+		committedSummaryTokens: 2_000,
+		committedUsage: {
+			input: 40_000,
+			output: 1_500,
+			cacheRead: 55_000,
+			cacheWrite: 500,
+			totalTokens: 97_000,
+			cost: {
+				input: 0.04,
+				output: 0.0075,
+				cacheRead: 0.0055,
+				cacheWrite: 0.001,
+				total: 0.054,
+			},
+		},
+		now: 61_000,
+		ts: "2026-09-02T00:00:00.000Z",
+		policy: "compact-reported",
+	});
+	assert.equal(rec.costBasis, "reported");
+	assert.equal(rec.costUSD, 0.054);
+	assert.deepEqual(rec.usage, {
+		input: 40_000,
+		output: 1_500,
+		cacheRead: 55_000,
+		cacheWrite: 500,
+		totalTokens: 97_000,
+	});
+	assert.equal(rec.counterfactualDefaultCostUSD, undefined);
+});
+
+test("events: deterministic path ignores unexpected committed usage", () => {
+	const rec = buildEventRecord({
+		pending: pending({ path: "deterministic", summaryTokens: 100 }),
+		committedUsage: {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 },
+		},
+		now: 1_001,
+		ts: "t",
+		policy: "p",
+	});
+	assert.equal(rec.costBasis, "zero");
+	assert.equal(rec.costUSD, 0);
+	assert.equal(rec.usage, undefined);
+});
+
+test("events: malformed committed usage falls back to derived cost", () => {
+	const valid = {
+		input: 40_000,
+		output: 1_500,
+		cacheRead: 55_000,
+		cacheWrite: 500,
+		totalTokens: 97_000,
+		cost: { input: 0.04, output: 0.0075, cacheRead: 0.0055, cacheWrite: 0.001, total: 0.054 },
+	};
+	const malformed: unknown[] = [
+		{ ...valid, input: -1 },
+		{ ...valid, input: 1n },
+		{ ...valid, cost: { ...valid.cost, total: -0.01 } },
+		{ ...valid, cost: { ...valid.cost, total: Number.MAX_VALUE } },
+		{ ...valid, cost: null },
+		{ cost: { total: Number.NaN } },
+		new Proxy(valid, { get: () => { throw new Error("hostile accessor"); } }),
+	];
+	for (const committedUsage of malformed) {
+		const rec = buildEventRecord({
+			pending: pending(),
+			committedSummaryTokens: 2_000,
+			committedUsage,
+			now: 1_001,
+			ts: "t",
+			policy: "p",
+		});
+		assert.equal(rec.costBasis, "derived");
+		assert.equal(rec.costUSD, 0.11);
+		assert.equal(rec.usage, undefined);
+	}
 });
 
 test("events: deterministic summaryTokens takes precedence over committed estimate", () => {
@@ -323,6 +410,139 @@ test("integration: llm-only compaction appends a derived-basis record from the c
 		// 50K × $2/MTok + 2K × $10/MTok = 0.10 + 0.02 = 0.12 (upper bound).
 		assert.equal(rec.costUSD, 0.12);
 		assert.equal(rec.counterfactualDefaultCostUSD, undefined);
+	});
+});
+
+test("integration: llm-only compaction records committed reported usage", async () => {
+	await withTempHome({ mode: "llm-only-with-dump" }, async (cwd, home) => {
+		const pi = makeFakePi();
+		await factory(pi as never);
+		const ctx = makeCtx(cwd, "evt-sess-reported");
+		const [result] = await pi.fire(
+			"session_before_compact",
+			makeEvent([asstTool("bash", "t1"), toolRes("bash", "t1")]),
+			ctx,
+		);
+		assert.equal(result, undefined, "llm-only falls through");
+		const reads = new Map<string, number>();
+		function oneReadProxy<T extends object>(target: T, prefix: string): T {
+			return new Proxy(target, {
+				get(proxyTarget, property, receiver) {
+					const key = `${prefix}.${String(property)}`;
+					const count = (reads.get(key) ?? 0) + 1;
+					reads.set(key, count);
+					if (count > 1) throw new Error(`re-read ${key}`);
+					return Reflect.get(proxyTarget, property, receiver) as unknown;
+				},
+			});
+		}
+		const cost = oneReadProxy(
+			{ input: 0.09, output: 0.012, cacheRead: 0.001, cacheWrite: 0, total: 0.103 },
+			"cost",
+		);
+		const usage = oneReadProxy(
+			{
+				input: 45_000,
+				output: 1_200,
+				cacheRead: 4_000,
+				cacheWrite: 0,
+				cacheWrite1h: 75,
+				reasoning: 300,
+				totalTokens: 50_200,
+				cost,
+			},
+			"usage",
+		);
+		await pi.fire(
+			"session_compact",
+			{ compactionEntry: { summary: "reported summary", usage } },
+			ctx,
+		);
+		const rec = JSON.parse(
+			(await fs.readFile(ledgerPathUnder(home), "utf8")).trim(),
+		) as CompactionEventRecord;
+		assert.equal(rec.path, "llm-only");
+		assert.equal(rec.costBasis, "reported");
+		assert.equal(rec.costUSD, 0.103);
+		assert.deepEqual(rec.usage, {
+			input: 45_000,
+			output: 1_200,
+			cacheRead: 4_000,
+			cacheWrite: 0,
+			cacheWrite1h: 75,
+			reasoning: 300,
+			totalTokens: 50_200,
+		});
+		for (const key of [
+			"usage.input",
+			"usage.output",
+			"usage.cacheRead",
+			"usage.cacheWrite",
+			"usage.cacheWrite1h",
+			"usage.reasoning",
+			"usage.totalTokens",
+			"usage.cost",
+			"cost.input",
+			"cost.output",
+			"cost.cacheRead",
+			"cost.cacheWrite",
+			"cost.total",
+		]) {
+			assert.equal(reads.get(key), 1, `${key} is snapshotted exactly once`);
+		}
+	});
+});
+
+test("integration: malformed usage preserves the derived ledger row", async () => {
+	await withTempHome({ mode: "llm-only-with-dump" }, async (cwd, home) => {
+		const pi = makeFakePi();
+		await factory(pi as never);
+		const ctx = makeCtx(cwd, "evt-sess-malformed");
+		await pi.fire(
+			"session_before_compact",
+			makeEvent([asstTool("bash", "t1"), toolRes("bash", "t1")]),
+			ctx,
+		);
+		const usage = new Proxy(
+			{},
+			{ get: () => { throw new Error("hostile accessor"); } },
+		);
+		await pi.fire(
+			"session_compact",
+			{ compactionEntry: { summary: "x".repeat(8_000), usage } },
+			ctx,
+		);
+		const rec = JSON.parse(
+			(await fs.readFile(ledgerPathUnder(home), "utf8")).trim(),
+		) as CompactionEventRecord;
+		assert.equal(rec.costBasis, "derived");
+		assert.equal(rec.costUSD, 0.12);
+		assert.equal(rec.usage, undefined);
+	});
+});
+
+test("integration: throwing compactionEntry usage getter preserves the derived row", async () => {
+	await withTempHome({ mode: "llm-only-with-dump" }, async (cwd, home) => {
+		const pi = makeFakePi();
+		await factory(pi as never);
+		const ctx = makeCtx(cwd, "evt-sess-entry-getter");
+		await pi.fire(
+			"session_before_compact",
+			makeEvent([asstTool("bash", "t1"), toolRes("bash", "t1")]),
+			ctx,
+		);
+		const compactionEntry = Object.defineProperty(
+			{ summary: "x".repeat(8_000) },
+			"usage",
+			{ get: () => { throw new Error("hostile entry usage getter"); } },
+		);
+		await pi.fire("session_compact", { compactionEntry }, ctx);
+		const rec = JSON.parse(
+			(await fs.readFile(ledgerPathUnder(home), "utf8")).trim(),
+		) as CompactionEventRecord;
+		assert.equal(rec.costBasis, "derived");
+		assert.equal(rec.costUSD, 0.12);
+		assert.equal(rec.summaryTokens, 2_000);
 	});
 });
 
